@@ -1,0 +1,2147 @@
+---
+title: "Master Thesis"
+author: "Henry Broadbent"
+date: "2026-01-16"
+output: 
+  html_document: 
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+# Clear environment
+rm(list = ls())
+
+```
+
+# Overview
+
+This file contains the analysis part of Henry Broadbent's Masters thesis (January 2026), conducted in R Studio 4.5.0. We Integrated IUCN species distribution data with human footprint indices to understand species richness patterns globally.
+
+------------------------------------------------------------------------
+
+# Content {.tabset}
+
+## Setup and Configuration
+
+### File Paths Configuration
+
+Set these paths according to your local file structure before running the analysis.
+
+```{r paths}
+
+
+# Base directory
+base_dir <- "~/Eawag/Master Project"
+
+# Input data paths
+path_main_data <- file.path(base_dir, "5_Submission/code/1_my_data/2_data_files/data_with_HFP_and_richness_new.csv")
+path_coordinates <- file.path(base_dir, "5_Submission/code/1_my_data/2_data_files/exact_coordinate_extraction.csv")
+
+# Richness raster paths
+path_mammals <- file.path(base_dir, "5_Submission/code/1_my_data/2_data_files/IUCN DATA CURRENT/Mammals/MAMMALS_SR_2024.tif")
+path_reptiles <- file.path(base_dir, "5_Submission/code/1_my_data/2_data_files/IUCN DATA CURRENT/reptiles/REPTILES_SR_2024.tif")
+path_amphibians <- file.path(base_dir, "5_Submission/code/1_my_data/2_data_files/IUCN DATA CURRENT/Amphibians/Amphibians_SR_2024.tif")
+path_birds <- file.path(base_dir, "5_Submission/code/1_my_data/2_data_files/IUCN DATA CURRENT/Birds/Birds_SR_2024.tif")
+path_fish <- file.path(base_dir, "5_Submission/code/1_my_data/2_data_files/IUCN DATA CURRENT/fish_richness.tif")
+
+# Human footprint path
+path_hfp <- file.path(base_dir, "5_Submission/code/1_my_data/2_data_files/hfp_mu_et_al_2013.tif")
+
+# Output directory
+output_dir <- file.path(base_dir, "3_Results/3_Plots")
+
+# Create output directory if it doesn't exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+```
+
+### Load Required Libraries
+
+```{r libraries, echo=FALSE, message=FALSE, warning=FALSE}
+
+
+# Load packages
+library(tidyverse)    # Data science ecosystem
+library(lme4)         # Mixed-effects models
+library(lmerTest)     # Tests for mixed models
+library(terra)        # Spatial raster data
+library(sf)           # Simple features for vector data
+library(stringi)      # String manipulation
+library(rnaturalearth) # World map data
+library(patchwork)    # Combining plots
+library(ggdist)
+
+# Print package versions for reproducibility
+cat("R version:", R.version.string, "\n")
+cat("terra version:", as.character(packageVersion("terra")), "\n")
+cat("sf version:", as.character(packageVersion("sf")), "\n")
+```
+
+---
+
+### Helper Functions
+
+#### Coordinate Cleaning Function
+
+This function standardizes coordinate formats by replacing various dash characters and removing whitespace.
+
+```{r helper-functions}
+fix_coord_string <- function(coord) {
+  # Replace different types of dashes with standard minus sign
+  coord <- stri_replace_all_regex(coord, "[–—−]", "-")
+  # Remove all whitespace
+  coord <- gsub("\\s+", "", coord)
+  return(coord)
+}
+```
+
+#### Richness Extraction Function
+
+This function extracts mean richness values from rasters within 5km buffers around study sites.
+
+
+```{r extraction-function}
+extract_richness_for_taxa <- function(raster_path, coordinates_df, taxa_name) {
+  
+  cat("\n========================================\n")
+  cat("Processing:", taxa_name, "\n")
+  cat("========================================\n")
+  
+  # Load raster
+  richness_raster <- terra::rast(raster_path)
+  cat("Raster loaded. Layers:", nlyr(richness_raster), "\n")
+  
+  # Clean coordinates
+  coordinates_clean <- coordinates_df %>%
+    filter(!is.na(coord_ref), coord_ref != "", coord_ref != " ") %>%
+    mutate(coord_ref_clean = fix_coord_string(coord_ref)) %>%
+    separate(coord_ref_clean, into = c("ref_Latitude", "ref_Longitude"), 
+             sep = ",", remove = FALSE) %>%
+    mutate(
+      ref_Latitude = as.numeric(ref_Latitude),
+      ref_Longitude = as.numeric(ref_Longitude)
+    ) %>%
+    filter(!is.na(ref_Latitude), !is.na(ref_Longitude))
+  
+  cat("Coordinates cleaned:", nrow(coordinates_clean), "valid locations\n")
+  
+  # Create spatial points
+  coordis <- coordinates_clean %>%
+    dplyr::select(ref_Latitude, ref_Longitude, Article_ID, Record_ID)
+  
+  points <- vect(coordis, geom = c("ref_Longitude", "ref_Latitude"), crs = "EPSG:4326")
+  
+  # Reproject raster if needed
+  if (crs(richness_raster) != crs(points)) {
+    cat("Reprojecting raster to EPSG:4326...\n")
+    richness_raster <- project(richness_raster, "EPSG:4326")
+  }
+  
+  # Create 5km buffers
+  cat("Creating 5km buffers...\n")
+  buffers <- buffer(points, width = 5000)
+  
+  # Extract mean richness
+  cat("Extracting richness values...\n")
+  extracted_values <- extract(richness_raster, buffers, fun = mean, na.rm = TRUE)
+  
+  # Create results dataframe
+  results <- data.frame(
+    Article_ID = coordis$Article_ID,
+    Record_ID = coordis$Record_ID,
+    ref_Latitude = coordis$ref_Latitude,
+    ref_Longitude = coordis$ref_Longitude,
+    extracted_values[, -1]  # Exclude ID column
+  )
+  
+  # Summarize by study
+  richness_cols <- names(results)[5:ncol(results)]
+  
+  study_summary <- results %>%
+    group_by(Article_ID, Record_ID) %>%
+    summarise(
+      n_sites = n(),
+      across(all_of(richness_cols),
+             list(mean = ~ mean(.x, na.rm = TRUE),
+                  sd = ~ sd(.x, na.rm = TRUE)),
+             .names = "{.col}_{.fn}"),
+      .groups = "drop"
+    )
+  
+  # Rename columns with taxa name
+  richness_col <- paste0(tolower(taxa_name), "_richness")
+  sd_col <- paste0(tolower(taxa_name), "_sd")
+  
+  study_summary <- study_summary %>%
+    rename(
+      !!richness_col := 4,  # First mean column after n_sites
+      !!sd_col := 5         # First sd column
+    )
+  
+  # Select relevant columns for joining
+  join_data <- study_summary %>%
+    dplyr::select(Article_ID, Record_ID, all_of(c(richness_col, sd_col)))
+  
+  cat("Extraction complete!\n")
+  cat("Sites processed:", nrow(results), "\n")
+  cat("Unique studies:", nrow(study_summary), "\n\n")
+  
+  return(join_data)
+}
+```
+
+
+---
+
+### Data Loading
+
+```{r load-data}
+# Load main dataset
+df <- read.csv(path_main_data)
+cat("Main dataset loaded:", nrow(df), "rows,", ncol(df), "columns\n")
+
+# Load coordinates
+coordinates <- read.csv(path_coordinates)
+cat("Coordinates loaded:", nrow(coordinates), "rows\n")
+
+# Display structure
+str(df, list.len = 10)
+```
+
+---
+
+### Richness Extraction by Taxonomic Group
+
+#### Mammals
+
+```{r extract-mammals}
+mammals_data <- extract_richness_for_taxa(path_mammals, coordinates, "Mammal")
+df <- left_join(df, mammals_data, by = c("Article_ID", "Record_ID"))
+
+# Summary statistics
+summary(df$mammal_richness)
+```
+
+#### Reptiles
+
+```{r extract-reptiles}
+reptiles_data <- extract_richness_for_taxa(path_reptiles, coordinates, "Reptile")
+df <- left_join(df, reptiles_data, by = c("Article_ID", "Record_ID"))
+
+summary(df$reptile_richness)
+```
+
+#### Amphibians
+
+```{r extract-amphibians}
+amphibians_data <- extract_richness_for_taxa(path_amphibians, coordinates, "Amphibian")
+df <- left_join(df, amphibians_data, by = c("Article_ID", "Record_ID"))
+
+summary(df$amphibian_richness)
+```
+
+#### Birds
+
+```{r extract-birds}
+birds_data <- extract_richness_for_taxa(path_birds, coordinates, "Bird")
+df <- left_join(df, birds_data, by = c("Article_ID", "Record_ID"))
+
+summary(df$bird_richness)
+```
+
+#### Fish
+
+```{r extract-fish}
+fish_data <- extract_richness_for_taxa(path_fish, coordinates, "Fish")
+df <- left_join(df, fish_data, by = c("Article_ID", "Record_ID"))
+
+summary(df$fish_richness)
+
+# Clean up memory
+rm(mammals_data, reptiles_data, amphibians_data, birds_data, fish_data)
+gc()
+```
+
+
+
+### Data Preparation for Analysis
+
+We filter the data to ensure data quality and create a total richness metric combining all taxonomic groups. We are left with 405 studies
+
+
+```{r prepare-dataset}
+df_complete <- df %>%
+  filter(continent != "Global") %>%
+  filter(Study.type != "Experimental") %>%
+  filter(Scale != "Continental/Global") %>%
+  filter(Comparative.design == "Different sites same time")%>%
+  mutate(
+    # Calculate total richness across all taxa
+    new_total_richness = mammal_richness + reptile_richness + 
+                        amphibian_richness + bird_richness + fish_richness,
+    # Scale richness for modeling (mean = 0, sd = 1)
+    richness_scaled = scale(new_total_richness)[,1]
+  )
+
+# Filter to complete cases for required variables
+vars_needed <- c("richness_scaled", "HFP_scaled", "continent", 
+                 "Article_ID", "alpha_diversity")
+df_complete <- df_complete[complete.cases(df_complete[, vars_needed]), ]
+
+# Set reference level for continent 
+df_complete$continent <- relevel(as.factor(df_complete$continent), 
+                                 ref = "South America")
+
+cat("Final dataset:", nrow(df_complete), "observations\n")
+cat("Studies by continent:\n")
+print(table(df_complete$continent))
+
+# save data
+write.csv(df_complete, "~/Eawag/Master Project/5_Submission/code/1_my_data/2_data_files/data_complete.csv")
+
+```
+
+#### Descriptive statistics
+```{r}
+df_complete %>%
+  group_by(Article_ID) %>%
+  summarise(record_count = n_distinct(Record_ID)) %>% 
+  summarise(mean_records = mean(record_count))
+```
+
+
+
+
+## Global Map
+
+### Global Map Preparation
+
+```{r spatial-prep}
+# Prepare coordinate data with diversity metrics
+df_to_join <- df %>%
+  mutate(local_diversity_perc = (exp(alpha_diversity) - 1) * 100) %>%
+  dplyr::select(Article_ID, Record_ID, local_diversity_perc, 
+                continent, HFP_weighted_buffer)
+
+# Clean and join coordinates
+coordis <- coordinates %>%
+  filter(!is.na(coord_ref), coord_ref != "", coord_ref != " ") %>%
+  mutate(coord_ref_clean = fix_coord_string(coord_ref)) %>%
+  separate(coord_ref_clean, into = c("ref_Latitude", "ref_Longitude"), 
+           sep = ",", remove = FALSE) %>%
+  mutate(
+    ref_Latitude = as.numeric(ref_Latitude),
+    ref_Longitude = as.numeric(ref_Longitude)
+  ) %>%
+  filter(!is.na(ref_Latitude), !is.na(ref_Longitude)) %>%
+  dplyr::select(ref_Latitude, ref_Longitude, Article_ID, Record_ID)
+
+coordis <- left_join(coordis, df_to_join, by = c("Article_ID", "Record_ID"))
+
+# Summarize by location
+data_spatial <- coordis %>%
+  group_by(Article_ID, Record_ID) %>% 
+  summarise(
+    avg_Longitude = mean(ref_Longitude, na.rm = FALSE),
+    avg_Latitude = mean(ref_Latitude, na.rm = FALSE),
+    avg_HFP = mean(HFP_weighted_buffer, na.rm = FALSE),
+    avg_change_perc = mean(local_diversity_perc, na.rm = TRUE),
+    continent = first(continent),
+    .groups = 'drop'
+  ) %>%
+  filter(!is.na(avg_change_perc)) %>%
+  mutate(
+    abs_change_perc = abs(avg_change_perc),
+    avg_change_perc_capped = pmin(pmax(avg_change_perc, -200), 200),
+    abs_change_perc_capped = pmin(abs_change_perc, 200)
+  ) %>%
+  arrange(desc(avg_change_perc))
+
+cat("Spatial data prepared for", nrow(data_spatial), "unique locations\n")
+```
+
+
+### Create Global Map
+
+```{r global-map}
+# Set projection (EPSG:4326 = WGS84 geographic coordinate system)
+target_crs <- "EPSG:4326"
+
+# Load and process HFP raster
+hfp_raster <- terra::rast(path_hfp)
+
+# Aggregate raster to reduce file size (factor of 10)
+# Why? This reduces computation time while maintaining visual quality
+hfp_raster_agg <- aggregate(hfp_raster, fact = 10, fun = mean)
+cat("Aggregated raster dimensions:", dim(hfp_raster_agg), "\n")
+
+# Project to target CRS
+hfp_raster_reproj <- project(hfp_raster_agg, target_crs, method = "bilinear")
+
+# Convert to dataframe for ggplot
+hfp_df <- as.data.frame(hfp_raster_reproj, xy = TRUE) %>%
+  rename(human_footprint_value = 3) %>%
+  filter(!is.na(human_footprint_value))
+
+# Convert study locations to spatial format
+data_spatial_sf <- data_spatial %>%
+  st_as_sf(coords = c("avg_Longitude", "avg_Latitude"), crs = "EPSG:4326") %>%
+  st_transform(crs = target_crs) %>%
+  mutate(
+    x = st_coordinates(.)[,1],
+    y = st_coordinates(.)[,2]
+  ) %>%
+  st_drop_geometry()
+
+# Load world coastlines
+world <- ne_coastline(scale = "medium", returnclass = "sf") %>%
+  st_transform(crs = target_crs)
+
+# Create map
+final_map <- ggplot() +
+  # Human footprint background layer
+  geom_raster(
+    data = hfp_df,
+    aes(x = x, y = y, fill = human_footprint_value),
+    alpha = 0.8
+  ) +
+  scale_fill_gradient(
+    name = "Human Footprint Index",
+    low = "white", 
+    high = "navy",
+    limits = c(0, 50),
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 30, 
+      barheight = 0.5,
+      order = 1
+    )
+  ) +
+  # Coastlines
+  geom_sf(data = world, color = "gray40", linewidth = 0.3, fill = NA) +
+  # Study locations
+  geom_point(
+    data = data_spatial_sf,
+    aes(x = x, y = y, color = avg_change_perc_capped),
+    size = 4,
+    shape = 16,
+    alpha = 0.8
+  ) +
+  scale_color_gradientn(
+    name = "Δ measured species richness (%)",
+    colors = c("#B2182B", "#D73027", "#F46D43", "#FC8D59", "#FEE06B", "#FFE8A0", 
+               "#D9EF8B", "#A6D96A", "#66BD63", "#1A9850", "#006837"),
+    values = scales::rescale(c(-100, -75, -50, -25, -10, 0, 10, 25, 50, 75, 100)),
+    breaks = c(-100, -75, -50, -25, -10, 0, 10, 25, 50, 75, 100),
+    labels = c("-100", "-75", "-50", "-25", "-10", "0", "10", "25", "50", "75", "100+"),
+    limits = c(-100, 100),
+    oob = scales::squish,
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 30, 
+      barheight = 0.5,
+      order = 2
+    )
+  ) +
+  coord_sf(expand = FALSE) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    legend.text = element_text(size = 16),
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    plot.background = element_rect(fill = NA, color = NA),
+    panel.background = element_rect(fill = NA, color = NA)
+  )
+
+print(final_map)
+
+# Save 
+ggsave("~/Eawag/Master Project/5_Submission/Poster/figures/global_map_with_study_summary.tiff", 
+       final_map, height = 10, width = 18, dpi = 300, compression = "lzw")
+```
+
+
+## Exploratory Analysis
+
+### Data Distributions
+
+#### Prep
+
+```{r}
+
+continent_colors <- c(
+  "Africa" = "#FC8D62",
+  "Asia" = "#66C2A5",
+  "Europe" = "#E78AC3",
+  "North America" = "#3B90E2",
+  "Oceania" = "#FFC92F",
+  "South America" = "#92C854"
+)
+
+df_complete <- df_complete %>%
+  group_by(continent) %>%
+  mutate(continent_label = paste0(continent, " (n=", n(), ")")) %>%
+  ungroup()
+
+continent_order <- sort(unique(df_complete$continent), decreasing = TRUE)
+label_lvls <- paste0(continent_order, " (n=", table(df_complete$continent)[continent_order], ")")
+df_complete$continent_label <- factor(df_complete$continent_label, levels = label_lvls)
+
+# Calculate continental averages
+continent_avgs <- df_complete %>%
+  group_by(continent) %>%
+  summarise(
+    mean_alpha = mean(alpha_diversity, na.rm = TRUE),
+    mean_richness = mean(new_total_richness, na.rm = TRUE),
+    mean_hfp = mean(HFP_weighted_buffer, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+```
+
+
+#### Species richness change
+
+```{r}
+
+p_alpha <- ggplot(df_complete, aes(x = alpha_diversity)) +
+  geom_histogram(                 bins = 30, fill = "gray70", color = "black", alpha = 0.7) +
+  geom_vline(xintercept = median(df$alpha_diversity, na.rm = TRUE), 
+             linetype = "dashed", color = "#E74C3C", linewidth = 1) +
+  labs(x = "Δ measured species richness (LRR)",
+       y = "Number of Studies") +
+  theme_minimal(base_size = 15) +
+  theme(axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10)))
+
+```
+
+#### Human Footprint Index
+
+```{r}
+p1_hfp <- ggplot(df_complete, aes(x = continent_label, y = HFP_weighted_buffer, fill = continent)) +
+stat_halfeye(adjust = 0.5, width = 0.6, .width = 0, justification = -0.3, point_colour = NA, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, fatten = 0) +
+  stat_summary(
+    fun.data = function(x) {
+      m <- median(x, na.rm = TRUE)
+      return(data.frame(y = m, ymin = m, ymax = m))
+    },
+    geom = "errorbar",
+    width = 0.3,  # Controls how far over the borders it goes
+    size = 1,      # Controls thickness
+    color = "black"
+  ) +
+  geom_point(size = 0.8, alpha = 0.2, position = position_jitter(seed = 1, width = 0.1)) +
+  scale_fill_manual(values = continent_colors) +
+  labs(x = "", y = "Human Footprint Index") +
+  coord_flip() + theme_minimal(base_size = 14) + theme(legend.position = "none",theme(axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))))
+
+p2_hfp <- ggplot(df_complete, aes(x = HFP_weighted_buffer)) +
+  geom_histogram(bins = 30, alpha = 0.7, fill = "gray70", color = "black", linewidth = 0.3) +
+  geom_vline(xintercept = median(df_complete$HFP_weighted_buffer, na.rm = TRUE), 
+             linetype = "dashed", color = "#E74C3C", linewidth = 1) +
+  labs(x = "Human Footprint Index",
+       y = "Number of studies") +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))
+  )
+
+
+```
+
+
+#### Reference Site Species Richness
+
+```{r}
+p1_richness <- ggplot(df_complete, aes(x = continent_label, y = new_total_richness, fill = continent)) +
+  stat_halfeye(adjust = 0.5, width = 0.6, .width = 0, justification = -0.3, point_colour = NA, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, fatten = 0) +
+  stat_summary(
+    fun.data = function(x) {
+      m <- median(x, na.rm = TRUE)
+      return(data.frame(y = m, ymin = m, ymax = m))
+    },
+    geom = "errorbar",
+    width = 0.3,  # Controls how far over the borders it goes
+    size = 1,      # Controls thickness
+    color = "black"
+  ) +
+  geom_point(size = 0.8, alpha = 0.2, position = position_jitter(seed = 1, width = 0.1)) +
+  scale_fill_manual(values = continent_colors) +
+  labs(x = "", y = "Reference site species richness") +
+  coord_flip() + theme_minimal(base_size = 14) + theme(legend.position = "none", theme(axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))))
+
+p2_richness <- ggplot(df_complete, aes(x = new_total_richness)) +
+  geom_histogram(bins = 30, alpha = 0.7, fill = "gray70", color = "black", linewidth = 0.3) +
+  geom_vline(xintercept = median(df_complete$new_total_richness, na.rm = TRUE), 
+             linetype = "dashed", color = "#E74C3C", linewidth = 1) +
+  labs(x = "Reference site species richness",
+       y = "Number of studies") +
+  theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "bottom",
+    panel.grid.minor = element_blank(),
+    theme(axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10)))
+  )
+```
+
+```{r}
+
+print(p_alpha)
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/local_diversity_loss_distribution.tiff", p_alpha, 
+       width = 9, height = 5, dpi = 300)
+
+
+combined_richness <- p2_richness + p1_richness &
+  plot_annotation(tag_levels = 'a') 
+print(combined_richness)
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/predictors_richness_combined.tiff", combined_richness, 
+       width = 9, height = 5, dpi = 300)
+
+combined_hfi <- p2_hfp + p1_hfp &
+  plot_annotation(tag_levels = 'a') 
+
+print(combined_hfi)
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/predictors_hfi_combined.tiff", combined_hfi, 
+       width = 9, height = 5, dpi = 300)
+
+
+```
+### Taxonomic Breakdown
+
+```{r}
+
+# Reshape data for taxa breakdown
+data_long <- df_complete %>%
+  pivot_longer(cols = c(mammal_richness, bird_richness, amphibian_richness, 
+                        reptile_richness, fish_richness),
+               names_to = "taxa",
+               values_to = "richness") %>%
+  mutate(taxa = case_when(
+    taxa == "fish_richness" ~ "fish",
+    TRUE ~ gsub("_richness", "s", taxa)
+  ))
+
+# Calculate averages per taxa and continent
+data_summary <- data_long %>%
+  group_by(continent, taxa) %>%
+  summarise(avg_richness = mean(richness, na.rm = TRUE), .groups = "drop")
+
+# Lollipop Plot
+richness_breakdown <- ggplot(data_summary, aes(x = avg_richness, y = taxa, color = continent)) +
+  geom_segment(aes(x = 0, xend = avg_richness, y = taxa, yend = taxa), 
+               linewidth = 1, alpha = 0.5) +
+  geom_point(size = 4) +
+  facet_wrap(~continent, ncol = 2) +
+  scale_x_log10(breaks = c(1, 5, 10, 20, 50, 100, 200, 500)) +
+  scale_color_manual(values = continent_colors) +
+  labs(x = expression(paste(bar(x), " reference site species richness (Log Scale)")),
+       y = "") +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "none", strip.text = element_text(face = "bold"),
+    theme(axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))))
+
+richness_breakdown
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/richness_breakdown.tiff", richness_breakdown, 
+       width = 9, height = 5, dpi = 300)
+```
+
+### HFI and diversity loss relationships
+
+```{r}
+p1 <- ggplot(df_complete, aes(y = alpha_diversity, x = HFP_weighted_buffer, colour = Pressure)) + 
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "gam", se = TRUE) +
+  labs(x = "Human Footprint Index",
+       y = "Δ measured species richness") +
+  theme_minimal()
+
+p2 <- ggplot(df_complete, aes(y = alpha_diversity, x = HFP_weighted_buffer, colour = Organism)) + 
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "gam", se = TRUE) +
+  labs(x = "Human Footprint Index",
+       y = "Δ measured species richness") +
+  theme_minimal()
+
+p3 <- ggplot(df_complete, aes(y = alpha_diversity, x = HFP_weighted_buffer, colour = continent)) + 
+  geom_point(alpha = 0.5) +
+  geom_smooth(method = "gam", se = TRUE) +
+  labs(x = "Human Footprint Index",
+       y = "Δ measured species richness") +
+  scale_colour_manual(values = continent_colors) +
+  theme_minimal(base_size = 15) +
+  theme(
+    theme(axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))))
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/appendix/africa_interaction.tiff", p3, 
+       width = 9, height = 5, dpi = 300)
+```
+
+
+### Trivariate correlations
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+continent_avgs <- df_complete %>%
+  group_by(continent) %>%
+  summarise(
+    mean_alpha = mean(alpha_diversity, na.rm = TRUE),
+    mean_richness = mean(new_total_richness, na.rm = TRUE),
+    mean_hfp = mean(HFP_weighted_buffer, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# 2. Create the Plot
+trivariate_correlaiton <- ggplot(df_complete, aes(y = new_total_richness, x = HFP_weighted_buffer)) +
+
+  geom_point(aes(color = continent), size = 1.5, alpha = 0.3) +
+
+  geom_smooth(method = "lm", color = "black", fill = "gray20", 
+              linewidth = 1.2, alpha = 0.2) +
+
+  geom_smooth(aes(color = continent), method = "lm", se = FALSE, linewidth = 0.8) +
+
+  geom_point(data = continent_avgs, 
+             aes(y = mean_richness, x = mean_hfp, color = continent), 
+             size = 5) +
+
+  scale_color_manual(values = continent_colors) +
+  labs(y = "Reference site pecies richness", 
+       x = "Human Footprint Index") +
+  theme_minimal(base_size = 15) + 
+
+  theme(legend.position = "bottom",
+    theme(axis.title.x = element_text(margin = margin(t = 10)),
+        axis.title.y = element_text(margin = margin(r = 10))))
+
+trivariate_correlaiton
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/trivariate_correlations.tif", trivariate_correlaiton, 
+       width = 9, height = 5, dpi = 300, bg = NA)
+
+
+
+```
+
+##### poster version
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# 1. Define the groups
+gray_continents <- c("Europe", "Oceania", "Africa")
+
+# 2. Create the Plot
+trivariate_correlaiton <- ggplot(df_complete, aes(y = new_total_richness, x = HFP_weighted_buffer)) +
+
+  # All Data Points (Keep original colors) ---
+  geom_point(aes(color = continent), size = 1.5, alpha = 0.3) +
+
+  # Gray Lines (Europe, Oceania, Africa) ---
+
+  geom_smooth(data = subset(df_complete, continent %in% gray_continents), 
+              aes(group = continent), 
+              method = "lm", se = FALSE, color = "gray60", linewidth = 0.8) +
+
+  # Colored Lines (The significant ones) 
+  geom_smooth(data = subset(df_complete, !continent %in% gray_continents), 
+              aes(color = continent), 
+              method = "lm", se = FALSE, linewidth = 1) +
+
+  # Global Trend (Black)
+  geom_smooth(method = "lm", color = "black", fill = "gray20", 
+              linewidth = 1, alpha = 0.2) +
+  
+  scale_color_manual(values = continent_colors) +
+  labs(y = "Reference site species richness", 
+       x = "Human Footprint Index") +
+  theme_minimal(base_size = 16) + 
+
+  theme(
+    legend.position = "right",
+    legend.direction = "vertical",
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)),
+    legend.text = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.key.size = unit(0.5, "cm")
+  )
+
+trivariate_correlaiton
+
+# Save the plot
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/trivariate_correlations_poster.tif", 
+       trivariate_correlaiton, 
+       width = 9, height = 4, dpi = 300, bg = NA)
+```
+
+
+```{r}
+library(emmeans)
+
+cor_overall <- cor.test(df_complete$HFP_scaled, df_complete$richness_scaled, 
+                        method = "pearson")
+print(cor_overall)
+
+# Continent-specific correlations
+cor_by_continent <- df_complete %>%
+  group_by(continent) %>%
+  summarise(
+    n = n(),
+    correlation = cor(HFP_scaled, richness_scaled, use = "complete.obs"),
+    p_value = cor.test(HFP_scaled, richness_scaled)$p.value,
+    .groups = "drop"
+  ) %>%
+  arrange(correlation)
+
+print(cor_by_continent)
+```
+
+
+```{r}
+
+# ANOVA for richness differences across continents
+aov_richness <- aov(richness_scaled ~ continent, data = df_complete)
+summary(aov_richness)
+
+aov_richness <- lm(richness_scaled ~ continent, data = df_complete)
+summary(aov_richness)
+
+# 51% variance explained by continent
+
+# ANOVA for HFP differences across continents
+aov_hfp <- aov(HFP_scaled ~ continent, data = df_complete)
+summary(aov_hfp)
+
+aov_hfp <- lm(HFP_scaled ~ continent, data = df_complete)
+summary(aov_hfp)
+# 14.5% explained by continent
+```
+
+#### Tukey tests
+
+```{r}
+
+emmeans_richness <- emmeans(aov_richness, pairwise ~ continent, adjust = "tukey")
+
+richness_contrasts <- as.data.frame(emmeans_richness$contrasts) %>%
+  mutate(
+    # Add significance column
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    ),
+    # Shorten continent names
+    contrast = str_replace_all(contrast, c(
+      "North America" = "NA",
+      "South America" = "SA",
+      "Africa" = "AF",
+      "Asia" = "AS",
+      "Europe" = "EU",
+      "Oceania" = "OC"
+    ))
+  ) %>%
+  arrange(contrast) %>%
+  dplyr::select(contrast, estimate, SE, df, t.ratio, p.value, significance)
+
+print(richness_contrasts)
+
+emmeans_hfp <- emmeans(aov_hfp, pairwise ~ continent, adjust = "tukey")
+
+hfp_contrasts <- as.data.frame(emmeans_hfp$contrasts) %>%
+  mutate(
+    significance = case_when(
+      p.value < 0.001 ~ "***",
+      p.value < 0.01 ~ "**",
+      p.value < 0.05 ~ "*",
+      TRUE ~ "ns"
+    ),
+    contrast = str_replace_all(contrast, c(
+      "North America" = "NA",
+      "South America" = "SA",
+      "Africa" = "AF",
+      "Asia" = "AS",
+      "Europe" = "EU",
+      "Oceania" = "OC"
+    ))
+  ) %>%
+  arrange(contrast) %>%
+  dplyr::select(contrast, estimate, SE, df, t.ratio, p.value, significance)
+
+print(hfp_contrasts)
+
+# Create summary table
+correlation_summary <- cor_by_continent %>%
+  mutate(
+    sig = ifelse(p_value < 0.001, "***", 
+                 ifelse(p_value < 0.01, "**", 
+                        ifelse(p_value < 0.05, "*", "ns")))
+  )
+
+print(correlation_summary)
+
+
+# Calculate continent means
+continent_means <- df_complete %>%
+  group_by(continent) %>%
+  summarise(
+    HFP_mean = mean(HFP_scaled, na.rm = TRUE),
+    richness_mean = mean(richness_scaled, na.rm = TRUE),
+    n = n()
+  )# Pearson correlation between continental means
+cor.test(continent_means$HFP_mean, continent_means$richness_mean)
+
+
+```
+
+## Modelling
+
+```{r include=FALSE}
+library(tidybayes)
+library(brms)
+library(loo)
+```
+
+### Exploratory linear models
+
+#### Model specification
+
+```{r echo=FALSE}
+# 1. Fit candidate models
+m1_hfp <- brm(alpha_diversity ~ HFP_scaled, 
+              family = student(),
+              data = df_complete,
+              cores = 1, chains = 4)
+
+m2_richness <- brm(alpha_diversity ~ HFP_scaled + richness_scaled, 
+                   family = student(),
+                   data = df_complete,
+                   cores = 1, chains = 4)
+
+m3_continent <- brm(alpha_diversity ~ HFP_scaled + continent, 
+                    family = student(),
+                    data = df_complete,
+                    cores = 1, chains = 4)
+
+m4_both <- brm(alpha_diversity ~ HFP_scaled + richness_scaled + continent, 
+               family = student(),
+               data = df_complete,
+               cores = 1, chains = 4)
+
+m5_richness_int <- brm(alpha_diversity ~ HFP_scaled * richness_scaled, 
+                   family = student(),
+                   data = df_complete,
+                   cores = 1, chains = 4)
+
+m6_continent_int <- brm(alpha_diversity ~ HFP_scaled * continent, 
+                    family = student(),
+                    data = df_complete,
+                    cores = 1, chains = 4)
+```
+
+#### Model comparison
+```{r}
+loo_m1 <- loo(m1_hfp, moment_match = TRUE)
+loo_m2 <- loo(m2_richness, moment_match = TRUE)
+loo_m3 <- loo(m3_continent, moment_match = TRUE)
+loo_m4 <- loo(m4_both, moment_match = TRUE)
+loo_m5 <- loo(m5_richness_int, moment_match = TRUE)
+loo_m6 <- loo(m6_continent_int, moment_match = TRUE)
+
+# 3. Compare models
+loo_compare(loo_m1, loo_m2, loo_m3, loo_m4, loo_m5, loo_m6)
+
+9.6 / (2*5)
+
+loo_compare(loo_m1, loo_m2, loo_m3, loo_m4, loo_m5)
+
+-7 / (2* 4.6)
+
+ # 5. Check if richness and continent are redundant
+summary(m4_both)  # If credible intervals overlap 0 after adding both, they're redundant
+summary(m6_continent_int)
+
+```
+
+### Candidate models
+
+#### Setup
+
+```{r}
+
+set.seed(123)
+hfp_center <- mean(df_complete$HFP_weighted_buffer)
+hfp_scale <- sd(df_complete$HFP_weighted_buffer)
+richness_center <- mean(df_complete$new_total_richness)
+richness_scale <- sd(df_complete$new_total_richness)
+```
+
+#### Linear models
+
+```{r}
+
+prior_linear <- c(
+  prior(normal(-0.4, 1), class = "Intercept"),
+  prior(normal(0, 1), class = "b", coef = "HFP_scaled"),
+  prior(student_t(3, 0, 2.5), class = "sd", group = "Article_ID"),
+  prior(student_t(3, 0, 2.5), class = "sigma")
+)
+
+model_linear <- brm(
+  alpha_diversity ~ 1 + HFP_scaled + (1 | Article_ID),
+  data = df_complete,
+  prior = prior_linear,
+  save_pars = save_pars(all = TRUE),
+  chains = 4,
+  iter = 4000,
+  cores = 1
+)
+
+
+
+# HFI + RSSR
+
+model_linear_richness <- brm(
+  alpha_diversity ~ HFP_scaled + richness_scaled + (1 | Article_ID),
+  data = df_complete,
+  prior = c(
+    prior(normal(-0.4, 1), class = "Intercept"),
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 2.5), class = "sd", group = "Article_ID"),
+    prior(student_t(3, 0, 2.5), class = "sigma")
+  ),
+  save_pars = save_pars(all = TRUE),
+  chains = 4,
+  iter = 4000,
+  cores = 1
+)
+
+
+
+# HFI + continent
+
+model_linear_continent <- brm(
+  alpha_diversity ~ HFP_scaled + continent + (1 | Article_ID),
+  data = df_complete,
+  prior = c(
+    prior(normal(-0.4, 1), class = "Intercept"),
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 2.5), class = "sd", group = "Article_ID"),
+    prior(student_t(3, 0, 2.5), class = "sigma")
+  ),
+  save_pars = save_pars(all = TRUE),
+  chains = 4,
+  iter = 4000,
+  cores = 1
+)
+
+
+# HFI + Both
+
+
+model_linear_both <- brm(
+  alpha_diversity ~ HFP_scaled + richness_scaled + continent + (1 | Article_ID),
+  data = df_complete,
+  prior = c(
+    prior(normal(-0.4, 1), class = "Intercept"),
+    prior(normal(0, 1), class = "b"),
+    prior(student_t(3, 0, 2.5), class = "sd", group = "Article_ID"),
+    prior(student_t(3, 0, 2.5), class = "sigma")
+  ),
+  save_pars = save_pars(all = TRUE),
+  chains = 4,
+  iter = 4000,
+  cores = 1
+)
+
+```
+
+#### asymptotic model specifications
+
+```{r}
+df_complete %>%
+  filter(HFP_weighted_buffer >= 0 & HFP_weighted_buffer <= 10) %>%
+  summarise(mean_alpha = mean(alpha_diversity, na.rm = TRUE))
+
+
+prior_asymp <- c(
+  prior(normal(-0.4, 1), nlpar = "b", coef = "Intercept"),
+  prior(normal(-0.5, 1), nlpar = "c", coef = "Intercept"),
+  prior(student_t(3, 0, 2.5), class = "sd", group = "Article_ID", nlpar = "b"),
+  prior(student_t(3, 0, 2.5), class = "sigma")
+)
+
+# HFI only
+model_asymp <- brm(
+  bf(alpha_diversity ~ b * exp(c * HFP_scaled),
+     b ~ 1 + (1 | Article_ID),
+     c ~ 1,
+     nl = TRUE),
+  data = df_complete,
+  prior = prior_asymp,
+  save_pars = save_pars(all = TRUE),
+  chains = 4,
+  iter = 4000,
+  cores = 1
+)
+
+
+# HFI + RSSR
+
+model_asymp_richness <- brm(
+  bf(alpha_diversity ~ b * exp(c * HFP_scaled),
+     b ~ 1 + richness_scaled + (1 | Article_ID),
+     c ~ 1,
+     nl = TRUE),
+  prior = c(
+    prior(normal(-0.4, 1), nlpar = "b", coef = "Intercept"),
+    prior(normal(-0.5, 1), nlpar = "c", coef = "Intercept"),
+    prior(student_t(3, 0, 2.5), class = "sd", group = "Article_ID", nlpar = "b"),
+    prior(student_t(3, 0, 2.5), class = "sigma")
+  ),
+  data = df_complete,
+  save_pars = save_pars(all = TRUE),
+  chains = 4,
+  iter = 4000,
+  cores = 1
+)
+
+
+
+# HFI + Continent
+
+model_asymp_continent <- brm(
+  bf(alpha_diversity ~ b * exp(c * HFP_scaled),
+     b ~ continent + (1 | Article_ID),
+     c ~ 1,
+     nl = TRUE),
+  prior = c(
+    prior(normal(-0.4, 1), class = "b", coef = "Intercept", nlpar = "b"),
+    prior(normal(0, 0.5), class = "b", nlpar = "b"),  # continent effects
+    prior(normal(-0.5, 1), class = "b", coef = "Intercept", nlpar = "c"),
+    prior(student_t(3, 0, 2.5), class = "sd", nlpar = "b", group = "Article_ID"),
+    prior(student_t(3, 0, 2.5), class = "sigma")
+  ),
+  data = df_complete,
+  save_pars = save_pars(all = TRUE),
+  chains = 4,
+  iter = 4000,
+  cores = 1
+)
+
+
+
+# HFI + Both
+
+model_asymp_both <- brm(
+  bf(alpha_diversity ~ b * exp(c * HFP_scaled),
+     b ~ continent + richness_scaled + (1 | Article_ID),
+     c ~ 1,
+     nl = TRUE),
+  prior = c(
+    prior(normal(-0.4, 1), class = "b", coef = "Intercept", nlpar = "b"),
+    prior(normal(0, 0.5), class = "b", nlpar = "b"),  # continent effects
+    prior(normal(-0.5, 1), class = "b", coef = "Intercept", nlpar = "c"),
+    prior(student_t(3, 0, 2.5), class = "sd", nlpar = "b", group = "Article_ID"),
+    prior(student_t(3, 0, 2.5), class = "sigma")
+  ),
+  data = df_complete,
+  save_pars = save_pars(all = TRUE),
+  chains = 4,
+  iter = 4000,
+  cores = 1
+)
+
+
+```
+
+#### Model comparison
+
+```{r}
+loo_asymp <- loo(model_asymp, moment_match = TRUE)
+loo_linear <- loo(model_linear, moment_match = TRUE)
+
+loo_asymp_richness <- loo(model_asymp_richness, moment_match = TRUE)
+loo_linear_richness <- loo(model_linear_richness, moment_match = TRUE)
+
+loo_asymp_continent <- loo(model_asymp_continent, moment_match = TRUE)
+loo_linear_continent <- loo(model_linear_continent, moment_match = TRUE)
+
+loo_asymp_both <- loo(model_asymp_both, moment_match = TRUE)
+loo_linear_both <- loo(model_linear_both, moment_match = TRUE)
+```
+
+
+```{r}
+comparison_all <- loo_compare(
+  loo_linear, loo_linear_richness, loo_linear_continent, loo_linear_both,
+  loo_asymp, loo_asymp_richness, loo_asymp_continent, loo_asymp_both
+)
+
+
+print("\n=== COMPREHENSIVE MODEL COMPARISON ===")
+print(comparison_all)
+
+# Calculate significance of differences
+cat("\n=== Model Comparison Significance ===\n")
+for(i in 2:nrow(comparison_all)) {
+  diff <- comparison_all[i, "elpd_diff"]
+  se <- comparison_all[i, "se_diff"]
+  ratio <- abs(diff/se)
+  
+  cat("\n", rownames(comparison_all)[i], "vs", rownames(comparison_all)[1], ":\n")
+  cat("  ELPD diff:", round(diff, 2), "B1 SE:", round(se, 2), "\n")
+  cat("  Ratio:", round(ratio, 2), "\n")
+  cat("  Interpretation:", ifelse(ratio > 2, 
+                                  "Models meaningfully different", 
+                                  "Difference uncertain"), "\n")
+}
+
+# 1. Convert the loo comparison object to a data frame
+results_df <- as.data.frame(comparison_all)
+
+# 2. Move row names to a column for cleaning
+results_df$model_code <- rownames(results_df)
+
+# 3. Create a readable Model Name column 
+
+name_mapping <- c(
+  "loo_asymp"           = "A: HFI",
+  "loo_linear"          = "L: HFI",
+  "loo_asymp_richness"  = "A: HFI + RSSR",
+  "loo_linear_richness" = "L: HFI + RSSR",
+  "loo_asymp_continent" = "A: HFI + continent",
+  "loo_linear_continent" = "L: HFI + continent",
+  "loo_asymp_both"      = "A: HFI + both",
+  "loo_linear_both"     = "L: HFI + both"
+)
+
+results_df$model <- name_mapping[results_df$model_code]
+
+# 4. Calculate Ratio
+
+results_df$ratio <- abs(results_df$elpd_diff / results_df$se_diff)
+results_df$ratio[is.nan(results_df$ratio)] <- 0
+
+# 5. Determine Status
+# First row is Best, others are judged by ratio > 2
+results_df$status <- ifelse(results_df$elpd_diff == 0, "Best Model",
+                            ifelse(results_df$ratio > 2, "Meaningfully different", "Indistinguishable"))
+
+# 6. Select and Reorder columns to match your template
+final_table <- results_df[, c("model", "elpd_loo", "se_elpd_loo", "elpd_diff", "se_diff", "ratio", "status")]
+
+numeric_cols <- c("elpd_loo", "se_elpd_loo", "elpd_diff", "se_diff", "ratio")
+final_table[numeric_cols] <- round(final_table[numeric_cols], 2)
+
+# 7. View the final table in R console
+print(final_table)
+
+# 8. Save to CSV
+write.csv(final_table, "~/Eawag/Master Project/5_Submission/code/1_my_data/2_data_files/model_comparison_results_new.csv", row.names = FALSE)
+
+```
+### Model diagnostics
+
+#### R2
+
+```{r}
+# Marginal RB2: variance explained by fixed effects (HFI + continent)
+r2_marginal <- bayes_R2(model_asymp_continent, re_formula = NA)
+
+# Conditional RB2: variance explained by fixed + random effects
+r2_conditional <- bayes_R2(model_asymp_continent, re_formula = NULL)
+
+# LOO-RB2: out-of-sample predictive performance (penalizes overfitting)
+r2_loo <- loo_R2(model_asymp_continent)
+
+cat("\n=== MODEL FIT METRICS ===\n")
+cat("Marginal RB2 (HFI + Continent only):", sprintf("%.3f [%.3f, %.3f]\n", 
+                                                   r2_marginal[1], r2_marginal[3], r2_marginal[4]))
+cat("Conditional RB2 (including Article effects):", sprintf("%.3f [%.3f, %.3f]\n", 
+                                                           r2_conditional[1], r2_conditional[3], r2_conditional[4]))
+cat("LOO RB2 (out-of-sample):", sprintf("%.3f [%.3f, %.3f]\n", 
+                                       r2_loo[1], r2_loo[3], r2_loo[4]))
+
+# Visualize RB2 distributions
+r2_samples <- data.frame(
+  Marginal = bayes_R2(model_asymp_continent, re_formula = NA, summary = FALSE)[,1],
+  Conditional = bayes_R2(model_asymp_continent, re_formula = NULL, summary = FALSE)[,1]
+) %>%
+  pivot_longer(everything(), names_to = "Type", values_to = "R2")
+
+plot_r2 <- ggplot(r2_samples, aes(x = R2, fill = Type)) +
+  geom_density(alpha = 0.6) +
+  geom_vline(data = data.frame(
+    Type = c("Marginal", "Conditional"),
+    R2 = c(r2_marginal[1], r2_conditional[1])
+  ), aes(xintercept = R2, color = Type), linetype = "dashed", linewidth = 1) +
+  labs(title = "Bayesian RB2 Distribution",
+       subtitle = "Marginal = HFI + Continent | Conditional = + Article random effects",
+       x = "RB2 (proportion of variance explained)", y = "Density") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+plot_r2
+
+ggsave("~/Eawag/R/Master_thesis/3_Results/Plots/model_fit_r2.tiff", plot_r2, width = 8, height = 5, dpi = 300)
+```
+
+#### I2
+
+```{r}
+library(brms)
+library(dplyr)
+library(posterior) # brms uses this for handling draws
+
+# Extract the full posterior distribution
+draws <- as_draws_df(model_asymp_continent)
+
+# tau = Between-study SD (Standard deviation of the Article random intercepts)
+# sigma = Within-study SD (Residual standard deviation of the model)
+
+tau2_posterior <- draws$sd_Article_ID__b_Intercept
+sigma2_posterior <- draws$sigma^2
+
+# Compute the I^2 distribution
+i2_distribution <- tau2_posterior / (tau2_posterior + sigma2_posterior)
+
+# Summarize the result (Mean and 95% Credible Interval)
+i2_summary <- quantile(i2_distribution, probs = c(0.5, 0.025, 0.975))
+
+cat("\n=== BAYESIAN HETEROGENEITY (I-SQUARED) ===\n")
+cat(sprintf("I² Median: %.2f%%\n", i2_summary[1] * 100))
+cat(sprintf("95%% CrI:   [%.2f%%, %.2f%%]\n", i2_summary[2] * 100, i2_summary[3] * 100))
+
+# Calculate the median variances to report in the text
+tau2_val <- median(tau2_posterior)
+sigma2_val <- median(sigma2_posterior)
+
+cat(sprintf("Correct Between-study variance (tau2): %.3f\n", tau2_val))
+cat(sprintf("Correct Residual variance (sigma2): %.3f\n", sigma2_val))
+```
+#### Sensitivity Analysis
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(brms)
+
+# Define the Weak Priors
+# normal(0, 10) which is very flat for LRR data (usually between -2 and 2)
+priors_weak <- c(
+  # Weak prior for Initial Diversity (b) Intercept
+  prior(normal(0, 10), class = "b", coef = "Intercept", nlpar = "b"),
+  
+  # Weak prior for Continent effects on b
+  prior(normal(0, 10), class = "b", nlpar = "b"), 
+  
+  # Weak prior for Decay Rate (c)
+  prior(normal(0, 10), class = "b", coef = "Intercept", nlpar = "c"),
+  
+  # Weak prior for Random Effects and Residuals
+  # Increasing scale from 2.5 to 10 makes these very broad half-t distributions
+  prior(student_t(3, 0, 10), class = "sd", nlpar = "b", group = "Article_ID"),
+  prior(student_t(3, 0, 10), class = "sigma")
+)
+
+# Run the Weak Prior Model
+
+model_weak_prior <- brm(
+  bf(alpha_diversity ~ b * exp(c * HFP_scaled),
+     b ~ continent + (1 | Article_ID),
+     c ~ 1,
+     nl = TRUE),
+  prior = priors_weak,
+  data = df_complete,
+  save_pars = save_pars(all = TRUE),
+  chains = 4,
+  iter = 4000,
+  cores = 1
+)
+
+
+prior_comparison <- data.frame(
+  `Original slope c` = as_draws_df(model_asymp_continent)$b_c_Intercept,
+  `Weak slope c`     = as_draws_df(model_weak_prior)$b_c_Intercept,
+  `Original intercept b` = as_draws_df(model_asymp_continent)$b_b_Intercept,
+  `Weak intercept b`     = as_draws_df(model_weak_prior)$b_b_Intercept
+)
+
+# Prepare data for plotting
+plot_data_all <- prior_comparison %>%
+  pivot_longer(everything(), names_to = "Model_Prior", values_to = "value") %>%
+  mutate(
+    Parameter = case_when(
+      grepl("slope", Model_Prior) ~ "Parameter c (HFI decay rate)",
+      grepl("intercept", Model_Prior) ~ "Parameter b (initial richness loss)",
+      TRUE ~ "Unknown"
+    ),
+    Model_Prior_Clean = gsub("\\.", " ", Model_Prior)
+  ) %>%
+  mutate(
+    Model_Prior_Clean = factor(Model_Prior_Clean, levels = c(
+      "Original intercept b", "Weak intercept b",
+      "Original slope c", "Weak slope c"
+    ))
+  )
+
+plot_prior_sensitivity <- ggplot(plot_data_all, aes(x = value, fill = Model_Prior_Clean)) +
+  
+  # Density plots with transparency
+  geom_density(alpha = 0.4, linewidth = 0.3, color = "black") +
+  
+  # This ensures 'b' and 'c' get their own x-axis ranges
+  facet_wrap(~Parameter, scales = "free", ncol = 2) +
+  
+  scale_fill_manual(values = c(
+    "Original intercept b" = "#7570B3", 
+    "Weak intercept b"     = "#D95F02",
+    "Original slope c"     = "#1B9E77", 
+    "Weak slope c"         = "#E7298A"
+  )) +
+  
+  labs(
+    x = "Parameter Estimate", 
+    y = "Posterior Density",
+    fill = "Model Specification"
+  ) +
+  
+  theme_minimal(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    strip.text = element_text(face = "bold", size = 12),
+    panel.grid.minor = element_blank()
+  )
+
+# save
+print(plot_prior_sensitivity)
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/appendix/prior_sensitivity_check.tiff", plot_prior_sensitivity, width = 10, height = 6)
+
+cat("\n=== PRIOR SENSITIVITY SUMMARY ===\n")
+sensitivity_summary <- prior_comparison %>%
+  summarise(across(everything(), list(
+    Mean = ~mean(.),
+    Lower = ~quantile(., 0.025),
+    Upper = ~quantile(., 0.975)
+  ))) %>%
+  pivot_longer(everything(), names_to = c("Parameter", "Stat"), names_sep = "_") %>%
+  pivot_wider(names_from = Stat, values_from = value)
+
+print(sensitivity_summary)
+```
+
+
+#### Pareto K and outliers
+
+```{r}
+
+pareto_k_asymp <- loo_asymp_continent$diagnostics$pareto_k
+df_diag_asymp <- df_complete %>%
+  mutate(
+    pareto_k = pareto_k_asymp,
+    flagged = ifelse(pareto_k > 0.7, "High Pareto k (>0.7)", "Good (<0.7)")
+  )
+
+p1_asymp <- ggplot(df_diag_asymp, aes(x = HFP_weighted_buffer, y = pareto_k)) +
+  geom_point(aes(color = flagged), alpha = 0.6, size = 2) +
+  geom_hline(yintercept = 0.7, linetype = "dashed", color = "red", linewidth = 0.8) +
+  scale_color_manual(values = c("High Pareto k (>0.7)" = "#D55E00", "Good (<0.7)" = "gray40")) +
+  labs(x = "HFI", y = "Pareto k") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "bottom")
+
+p2_asymp <- ggplot() +
+  geom_point(data = df_diag_asymp[df_diag_asymp$flagged == "Good (<0.7)", ],
+             aes(x = HFP_weighted_buffer, y = alpha_diversity),
+             alpha = 0.3, size = 1.5, color = "gray40") +
+  geom_point(data = df_diag_asymp[df_diag_asymp$flagged == "High Pareto k (>0.7)", ],
+             aes(x = HFP_weighted_buffer, y = alpha_diversity),
+             color = "#D55E00", size = 3, shape = 17) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black", linewidth = 0.5) +
+  labs(x = "HFI", y = "LRR") +
+  theme_minimal(base_size = 14)
+
+fig_asymp <- p1_asymp / p2_asymp &
+  plot_annotation(tag_levels = 'a') 
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/appendix/ParetoK_asymptotic_diagnostics.tiff",
+       fig_asymp, width = 8, height = 8, dpi = 300)
+
+```
+
+#### Posterior predictive check
+
+```{r}
+library(brms)
+library(bayesplot)
+library(ggplot2)
+library(patchwork) # Excellent for combining plots
+
+
+# simulate "new data" based on model to compare with real data
+y <- df_complete$alpha_diversity  # observed outcome variable
+yrep <- posterior_predict(model_asymp_continent, ndraws = 500) # 500 simulations
+
+color_scheme_set("blue")
+
+
+p_a <- ppc_dens_overlay(y, yrep[1:50, ]) + # Use first 50 draws to avoid clutter
+  labs(subtitle = "Dark line = observed data, Light lines = posterior predictions") +
+  labs(x = "Δ measured species richness", y = "Density") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+p_b <- ppc_intervals(y, yrep) +
+  labs(subtitle = "Observed points (dots) vs. 50% and 90% credible intervals") +
+  labs( y = "Δ measured species richness") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(), # Hide x-axis labels if too cluttered
+        axis.ticks.x = element_blank())
+
+p_c <- ppc_error_hist(y, yrep[1:9, ]) + 
+  labs(subtitle = "Residuals (y - y_rep) for 9 random posterior draws") +
+  theme_minimal()
+
+combined_plot <- (p_a + p_b) / p_c &
+  plot_annotation(tag_levels = 'a') 
+ 
+
+# View and Save
+print(combined_plot)
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/appendix/PPC.tiff", 
+       combined_plot, width = 10, height = 10, dpi = 300)
+```
+#### Residual diagnostic plots
+
+```{r}
+library(brms)
+library(ggplot2)
+library(dplyr)
+library(patchwork) # For combining the plots nicely
+
+plot_data <- model_asymp_continent$data
+
+# A. Conditional Values (Including Article Random Effects)
+cond_fitted <- fitted(model_asymp_continent)[, "Estimate"]
+cond_resid  <- residuals(model_asymp_continent)[, "Estimate"]
+
+# B. Marginal Values (Fixed Effects Only: HFI + Continent)
+marg_fitted <- fitted(model_asymp_continent, re_formula = NA)[, "Estimate"]
+marg_resid  <- plot_data$alpha_diversity - marg_fitted
+
+plot_data$fitted_cond <- cond_fitted
+plot_data$resid_cond  <- cond_resid
+plot_data$fitted_marg <- marg_fitted
+plot_data$resid_marg  <- marg_resid
+plot_data$sqrt_resid  <- sqrt(abs(cond_resid)) # For Scale-Location plot
+
+my_theme <- theme_minimal(base_size = 15)
+
+# Panel A: Residuals vs Fitted (Marginal)
+p1 <- ggplot(plot_data, aes(x = fitted_marg, y = resid_marg)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", color = "navy", fill = "blue", alpha = 0.2) +
+  labs(x = "Fitted values (Marginal)", y = "Residuals") +
+  my_theme
+
+# Panel B: Residuals vs Fitted (Conditional)
+p2 <- ggplot(plot_data, aes(x = fitted_cond, y = resid_cond)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", color = "navy", fill = "blue", alpha = 0.2) +
+  labs(x = "Fitted values (Conditional)", y = "Residuals") +
+  my_theme
+
+# Panel C: Residuals vs HFI
+p3 <- ggplot(plot_data, aes(x = HFP_scaled, y = resid_cond)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "loess", color = "navy", fill = "blue", alpha = 0.2) +
+  labs(x = "Human Footprint Index (Scaled)", y = "Residuals") +
+  my_theme
+
+# Panel D: Residuals by Continent
+p4 <- ggplot(plot_data, aes(x = continent, y = resid_cond, fill = continent)) +
+  geom_boxplot(alpha = 0.6, outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.2, size = 0.6) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = NULL, y = "Residuals") +
+  theme_minimal() + 
+  theme(legend.position = "none", 
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+# Panel E: Q-Q Plot
+p5 <- ggplot(plot_data, aes(sample = resid_cond)) +
+  stat_qq(alpha = 0.5) +
+  stat_qq_line(color = "red", linetype = "dashed") +
+  labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  my_theme
+
+# Panel F: Scale-Location Plot
+p6 <- ggplot(plot_data, aes(x = fitted_cond, y = sqrt_resid)) +
+  geom_point(alpha = 0.5, size = 1.5) +
+  geom_smooth(method = "loess", color = "navy", fill = "blue", alpha = 0.2) +
+  labs(x = "Fitted Values", y = expression(sqrt("|Residuals|"))) +
+  my_theme
+
+# Use patchwork to arrange in a 3x2 grid
+final_diagnostic_plot <- (p1 + p2) / (p3 + p4) / (p5 + p6) &
+  plot_annotation(tag_levels = 'a') 
+  
+print(final_diagnostic_plot)
+
+# Save high-resolution TIFF for your thesis
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/appendix/residual_diagnostics.tiff", 
+       final_diagnostic_plot, width = 10, height = 12, dpi = 300)
+```
+
+
+
+
+## Effect Size of HFI
+
+```{r include=FALSE}
+linear_slopes <- bind_rows(
+  model_linear %>% spread_draws(b_HFP_scaled) %>% 
+    mutate(Model = "HFI only"),
+  model_linear_richness %>% spread_draws(b_HFP_scaled) %>% 
+    mutate(Model = "HFI + Richness"),
+  model_linear_continent %>% spread_draws(b_HFP_scaled) %>% 
+    mutate(Model = "HFI + Continent"),
+  model_linear_both %>% spread_draws(b_HFP_scaled) %>% 
+    mutate(Model = "HFI + Continent + Richness")
+)
+
+plot_slopes <- ggplot(linear_slopes, aes(x = b_HFP_scaled, y = Model, fill = Model)) +
+  geom_vline(xintercept = 0, linetype = "dashed", alpha = 0.5) +
+  stat_halfeye(.width = c(0.66, 0.95)) +
+  theme_minimal(base_size = 15)+
+  labs(x = expression("HFP Slope " ~ beta[1]) , y = NULL,
+                            title = "Linear Models") +
+                        theme(legend.position = "none", axis.text.y = element_text(face = "bold")) +
+  xlim(-1, 0.25)
+
+# Calculate the SD of the original HFP variable
+hfp_sd <- sd(df_complete$HFP_weighted_buffer, na.rm = TRUE)
+
+print(paste("One SD of HFP =", round(hfp_sd, 2), "units"))
+c_params <- bind_rows(
+  model_asymp %>% spread_draws(b_c_Intercept) %>% 
+    mutate(Model = "HFI only"),
+  model_asymp_richness %>% spread_draws(b_c_Intercept) %>% 
+    mutate(Model = "HFI + Richness"),
+  model_asymp_continent %>% spread_draws(b_c_Intercept) %>% 
+    mutate(Model = "HFI + Continent"),
+  model_asymp_both %>% spread_draws(b_c_Intercept) %>% 
+    mutate(Model = "HFI + Continent + Richness")
+) %>%
+  mutate(
+    # Convert from "per SD" to "per 10 units of absolute HFP"
+    b_c_absolute_10 = (b_c_Intercept / hfp_sd) * 10 
+  )
+
+model_colors <- c(
+  "HFI only" = "grey",               
+  "HFI + Richness" = "grey",             
+  "HFI + Continent" = "skyblue3",         
+  "HFI + Continent + Richness" = "grey"  
+)
+
+
+c_params$Model <- factor(c_params$Model, levels = c(
+  "HFI + Continent + Richness", 
+  "HFI + Richness", 
+  "HFI only",
+  "HFI + Continent"
+))
+```
+
+
+### stats
+#### decay rates
+
+```{r}
+library(dplyr)
+library(tidybayes)
+
+summary(model_asymp_continent)
+
+decay_stats_percent <- c_params %>%
+  group_by(Model) %>%
+  mutate(
+    # Formula: (e^rate - 1) * 100
+    percent_change_10 = (exp(b_c_absolute_10) - 1) * 100
+  ) %>%
+  # Calculate Median and 95% Credible Intervals
+  median_qi(percent_change_10, .width = 0.95) %>%
+  # Select columns for clean printing
+  select(Model, percent_change_10, .lower, .upper)
+
+print("Decay in Alpha Diversity per 10 units of HFP (% Change):")
+print(decay_stats_percent)
+```
+
+#### predicted losses at mean and 0
+
+```{r}
+# effect size
+hfp_mean <- mean(df_complete$HFP_weighted_buffer, na.rm = TRUE)
+hfp_sd   <- sd(df_complete$HFP_weighted_buffer, na.rm = TRUE)
+
+# 2. Define the specific HFP values you want to probe
+target_values <- tibble(
+  Condition = c("pristine sites", "mean human influence"),
+  HFP   = c(0, hfp_mean)
+) %>%
+  # Manually scale them using the same math as your model input
+  mutate(HFP_scaled = (HFP - hfp_mean) / hfp_sd)
+
+global_predictions <- model_asymp_continent %>%
+  # Get predicted LRR values for the new data grid
+  add_epred_draws(
+    newdata = expand.grid(
+      HFP_scaled = target_values$HFP_scaled,
+      continent = unique(df_complete$continent), # Marginalize across continents
+      Article_ID = NA
+    ) %>% left_join(target_values, by = "HFP_scaled"),
+    re_formula = NA
+  ) %>%
+  
+  # Average across continents to get one Global distribution per Condition
+  group_by(Condition, .draw) %>%
+  summarise(pred_lrr = mean(.epred), .groups = "drop") %>%
+  
+  mutate(pred_percent_loss = (exp(pred_lrr) - 1) * 100)
+summary_predictions <- global_predictions %>%
+  group_by(Condition) %>%
+  median_qi(pred_percent_loss, .width = 0.95)
+
+print("--- Total % Loss of Diversity (relative to baseline controls) ---")
+print(summary_predictions)
+
+difference_stats <- global_predictions %>%
+  select(Condition, .draw, pred_percent_loss) %>%
+  pivot_wider(names_from = Condition, values_from = pred_percent_loss) %>%
+  mutate(
+    # Calculate the difference in percentage points
+    difference_pp = `mean human influence` - `pristine sites`
+  ) %>%
+  median_qi(difference_pp, .width = 0.95)
+
+print("--- Difference in % Loss (Moving from HFI=0 to HFI=Mean) ---")
+print(difference_stats)
+
+
+global_predictions$Condition <- factor(
+  global_predictions$Condition, 
+  levels = c("pristine sites", "mean human influence")
+)
+
+plot_loss_comparison <- ggplot(global_predictions, aes(x = pred_percent_loss, y = Condition, fill = Condition)) +
+  
+  # Add a reference line at 0 (No change)
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+  
+  # The Half-Eye Geometry
+  stat_halfeye(
+    .width = c(0.66, 0.95),  # Show 66% and 95% CI
+    point_color = "black",   # Make the median dot black
+    interval_color = "black",# Make the whisker bars black
+    alpha = 0.8              # Slight transparency
+  ) +
+  
+  scale_fill_brewer(palette = "Pastel2") + 
+  
+  theme_minimal(base_size = 15) +
+  labs(
+    x = "Predicted Change in Species Richness (%)",
+    y = NULL
+  ) +
+  theme(
+    legend.position = "none",
+    axis.text.x = element_text(face = "bold", size = 14),
+    panel.grid.minor = element_blank(),
+    axis.title.y = element_text(margin = margin(r = 10), size = 14),
+    plot.title = element_text(face = "bold")
+  ) +
+  coord_flip()
+
+# Display plot
+print(plot_loss_comparison)
+
+
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/HFI_effect_size_percent.tiff", plot_loss_comparison, 
+       width = 6, height = 4, dpi = 300)
+
+```
+
+
+```{r}
+library(brms)
+library(dplyr)
+library(tidyr)
+
+hfp_sd <- sd(df_complete$HFP_weighted_buffer, na.rm = TRUE)
+decay_stats <- c_params %>%
+  group_by(Model) %>%
+  median_qi(b_c_absolute_10, .width = 0.95) %>%
+  select(Model, b_c_absolute_10, .lower, .upper)
+
+print("Decay Constants (c) per 10 units of HFP (Median + 95% CrI):")
+print(decay_stats)
+
+global_decay_continent <- model_asymp_continent %>%
+  spread_draws(b_c_Intercept) %>%
+  mutate(c_per_10_units = (b_c_Intercept / hfp_sd) * 10,
+         half_distance_hfp = log(2) / (b_c_Intercept / hfp_sd)) %>%
+  median_qi(c_per_10_units, half_distance_hfp, .width = 0.95)
+  
+
+print("Marginalised Global Decay Constant (HFI + Continent):")
+print(global_decay_continent)
+
+```
+
+
+
+### plot
+
+```{r}
+
+plot_decay <- ggplot(c_params, aes(x = b_c_absolute_10, y = Model, fill = Model)) +
+
+  geom_vline(xintercept = 0, linetype = "dashed", color = "gray60") +
+
+  stat_halfeye(.width = c(0.66, 0.95), 
+    point_color = "black",
+    interval_color = "black"
+  ) +
+  
+  scale_fill_manual(values = model_colors) +
+  theme_minimal(base_size = 15) +
+  labs(
+    x = "Decay rate per 10 units of HFI (log scale)", 
+    y = NULL) +
+  theme(
+    legend.position = "none",
+    axis.text.y = element_text(face = "bold"),
+    panel.grid.minor = element_blank(),
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_text(margin = margin(r = 10)))
+
+# Display plot
+plot_decay
+  
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/HFI_effect size.tiff", plot_decay, 
+       width = 9, height = 5, dpi = 300)
+
+```
+
+
+## Main Findings
+
+### Decay curve plot
+
+```{r}
+continents <- unique(df_complete$continent)
+full_HFP_range <- seq(0, 50, length.out = 100)
+full_HFP_scaled <- (full_HFP_range - hfp_center) / hfp_scale
+
+pred_list <- lapply(continents, function(cont) {
+  newdata <- data.frame(HFP_scaled = full_HFP_scaled, continent = cont)
+  preds <- fitted(model_asymp_continent, newdata = newdata, re_formula = NA,
+                  probs = c(0.025, 0.975))
+  cbind(newdata, preds, HFP = full_HFP_range)
+})
+
+pred_continent <- do.call(rbind, pred_list)
+
+# Global average prediction
+pred_global <- pred_continent %>%
+  group_by(HFP, HFP_scaled) %>%
+  summarise(
+    Estimate = mean(Estimate),
+    Q2.5 = mean(Q2.5),
+    Q97.5 = mean(Q97.5),
+    .groups = "drop"
+  ) %>%
+  mutate(continent = "Global")
+
+# Combine for plotting
+pred_combined <- bind_rows(pred_continent, pred_global)
+pred_combined$continent <- factor(pred_combined$continent,
+                                  levels = c("Global", names(continent_colors)))
+
+continent_colors_with_global <- c("Global" = "black", continent_colors)
+
+plot_curves <- ggplot() +
+  geom_ribbon(data = pred_continent,
+              aes(x = HFP, ymin = Q2.5, ymax = Q97.5, fill = continent),
+              alpha = 0.1) +
+  geom_point(data = df_complete,
+             aes(x = HFP_weighted_buffer, y = alpha_diversity, color = continent),
+             alpha = 0.25, size = 0.8) +
+  geom_line(data = pred_combined,
+            aes(x = HFP, y = Estimate, color = continent, linewidth = continent),
+            alpha = 1) +
+  geom_hline(yintercept = 0, linetype = "dashed", alpha = 0.5, color = "gray30") +
+  scale_color_manual(values = continent_colors_with_global) +
+  scale_fill_manual(values = continent_colors_with_global, guide = "none") +
+  scale_linewidth_manual(
+    values = c("Global" = 1.5, 
+               setNames(rep(1, length(continent_colors)), names(continent_colors))),
+    guide = "none"
+  ) +
+  scale_x_continuous(breaks = seq(0, 50, by = 10), limits = c(0, 50)) +
+  scale_y_continuous(
+    breaks = seq(-1.5, 1, by = 0.5),
+    limits = c(-1.5, 1),
+    sec.axis = sec_axis(
+      transform = ~ (exp(.) - 1) * 100,
+      name = "Species Richness Change (%)",
+      breaks = c(-90, -75, -50, -25, 0, 50, 100, 150)
+    )
+  ) +
+  labs(x = "Human Footprint Index",
+       y = "Species Richness Change (LRR)",
+       color = "Continent") +
+  theme_minimal(base_size = 15) +
+  theme(panel.grid.minor = element_blank(),
+        legend.position = "bottom",
+        legend.direction = "horizontal",
+        legend.background = element_rect(fill = NA, color = NA),
+        axis.title.x = element_text(margin = margin(t = 10)),           # Remove nested theme()
+        axis.title.y.left = element_text(margin = margin(r = 10)),
+        axis.title.y.right = element_text(margin = margin(l = 10)))
+
+plot_curves
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/decay_plot.tiff", plot_curves, 
+       width = 8, height = 8, dpi = 300)
+
+```
+
+### posterior distributions of each continent
+
+```{r}
+
+
+# Extract posterior distributions for each continent
+continent_effects <- model_asymp_continent %>%
+  spread_draws(b_b_Intercept, b_b_continentAfrica, b_b_continentAsia, 
+               b_b_continentEurope, b_b_continentNorthAmerica, b_b_continentOceania) %>%
+  mutate(
+    `South America` = b_b_Intercept,
+    Africa = b_b_Intercept + b_b_continentAfrica,
+    Asia = b_b_Intercept + b_b_continentAsia,
+    Europe = b_b_Intercept + b_b_continentEurope,
+    `North America` = b_b_Intercept + b_b_continentNorthAmerica,
+    Oceania = b_b_Intercept + b_b_continentOceania
+  ) %>%
+  dplyr::select(`South America`, Africa, Asia, Europe, `North America`, Oceania) %>%
+  pivot_longer(everything(), names_to = "Continent", values_to = "Effect")
+
+# Probability of positive/negative effects
+cat("\n=== CONTINENT-SPECIFIC EFFECTS ===\n")
+continent_effects %>%
+  group_by(Continent) %>%
+  summarise(
+    Mean_LRR = mean(Effect),
+    Mean_Percent = (exp(mean(Effect)) - 1) * 100,
+    Prob_Positive = mean(Effect > 0),
+    Prob_Negative = mean(Effect < 0),
+    CI_lower = quantile(Effect, 0.025),
+    CI_upper = quantile(Effect, 0.975)
+  ) %>%
+  arrange(desc(Mean_LRR)) %>%
+  print()
+
+library(ggplot2)
+library(ggdist)
+
+# Extract posterior distributions for each continent AND global average
+continent_effects_individual <- model_asymp_continent %>%
+  spread_draws(b_b_Intercept, b_b_continentAfrica, b_b_continentAsia, 
+               b_b_continentEurope, b_b_continentNorthAmerica, b_b_continentOceania) %>%
+  mutate(
+    `South America` = b_b_Intercept,
+    Africa = b_b_Intercept + b_b_continentAfrica,
+    Asia = b_b_Intercept + b_b_continentAsia,
+    Europe = b_b_Intercept + b_b_continentEurope,
+    `North America` = b_b_Intercept + b_b_continentNorthAmerica,
+    Oceania = b_b_Intercept + b_b_continentOceania
+  ) %>%
+  mutate(
+    Global = (`South America` + Africa + Asia + Europe + `North America` + Oceania) / 6
+  ) %>%
+  dplyr::select(Global, `South America`, Africa, Asia, Europe, `North America`, Oceania) %>%
+  pivot_longer(everything(), names_to = "Continent", values_to = "Effect")
+
+continent_effects <- continent_effects_individual
+
+# Update the plot with global color
+library(forcats)
+p1 <- ggplot(continent_effects, aes(x = Effect, y = fct_relevel(reorder(Continent, Effect, median), "Global", after = Inf))) +
+  stat_halfeye(
+    aes(fill = Continent),
+    .width = c(0.95, 0.66),
+    alpha = 0.7
+  ) +
+  labs(y = NULL) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.5) + 
+  scale_fill_manual(values = c(continent_colors, Global = "gray20")) +
+  scale_x_continuous(
+    name = "N Species Richness (LRR)",
+    sec.axis = sec_axis(
+      trans = ~ (exp(.) - 1) * 100,
+      name = "N Species Richness (%)",
+      breaks = seq(-90, 100, by = 10)
+    )) +
+  theme_minimal(base_size = 15) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    legend.position = "none",
+    axis.title.x.bottom = element_text(margin = margin(t = 15)),
+    axis.title.x.top = element_text(margin = margin(b = 15)),
+    plot.background = element_rect(fill = "transparent", color = NA),
+    panel.background = element_rect(fill = "transparent", color = NA)
+  )
+p1
+ ggsave("~/Eawag/R/Master_thesis/3_Results/Plots/continent_baseline_differnces.tiff",p1, 
+        width = 10, height = 12, dpi = 300)
+```
+
+### Pairwise comparisons
+
+```{r}
+# Calculate HFP = 0 in scaled units
+hfi_0_scaled <- (0 - hfp_center) / hfp_scale
+
+# Test which continents are statistically different at HFP = 0
+continent_comparisons_HFI0 <- model_asymp_continent %>%
+  spread_draws(b_b_Intercept, b_b_continentAfrica, b_b_continentAsia, 
+               b_b_continentEurope, b_b_continentNorthAmerica, b_b_continentOceania,
+               b_c_Intercept) %>%
+  mutate(
+    # Calculate baseline at HFP = 0 for each continent
+    `South America_HFI0` = b_b_Intercept * exp(b_c_Intercept * hfi_0_scaled),
+    `Africa_HFI0` = (b_b_Intercept + b_b_continentAfrica) * exp(b_c_Intercept * hfi_0_scaled),
+    `Asia_HFI0` = (b_b_Intercept + b_b_continentAsia) * exp(b_c_Intercept * hfi_0_scaled),
+    `Europe_HFI0` = (b_b_Intercept + b_b_continentEurope) * exp(b_c_Intercept * hfi_0_scaled),
+    `North America_HFI0` = (b_b_Intercept + b_b_continentNorthAmerica) * exp(b_c_Intercept * hfi_0_scaled),
+    `Oceania_HFI0` = (b_b_Intercept + b_b_continentOceania) * exp(b_c_Intercept * hfi_0_scaled),
+    
+    # All comparisons vs South America (reference)
+    `Africa vs South America` = `Africa_HFI0` - `South America_HFI0`,
+    `Africa vs Asia` = `Africa_HFI0` - `Asia_HFI0`,
+    `Africa vs Oceania` = `Africa_HFI0` - `Oceania_HFI0`,
+    `Africa vs North America`  = `Africa_HFI0` - `North America_HFI0`, 
+    `Africa vs Europe` = `Africa_HFI0` - `Europe_HFI0`,
+      
+    `Asia vs South America` = `Asia_HFI0` - `South America_HFI0`,
+    `Asia vs Oceania` = `Asia_HFI0` - `Oceania_HFI0`,
+    `Asia vs North America` = `Asia_HFI0` - `North America_HFI0` ,
+    `Asia vs Europe` = `Asia_HFI0` - `Europe_HFI0`,
+    
+    `Europe vs South America` = `Europe_HFI0` - `South America_HFI0`,
+    `Europe vs North America` = `Europe_HFI0` - `North America_HFI0`,
+    `Europe vs Oceania` =  `Europe_HFI0` - `Oceania_HFI0`,
+    
+    `North America vs South America` = `North America_HFI0` - `South America_HFI0`,
+    `North America vs Oceania` = `North America_HFI0` - `Oceania_HFI0`,
+    
+    `Oceania vs South America` = `Oceania_HFI0` - `South America_HFI0`
+
+
+
+  ) %>%
+  dplyr::select(contains("vs")) %>%
+  pivot_longer(everything(), names_to = "Comparison", values_to = "Difference")
+
+# Statistical summary
+cat("\n=== PAIRWISE CONTINENT COMPARISONS AT HFP = 0 ===\n")
+pairwise_summary_HFI0 <- continent_comparisons_HFI0 %>%
+  group_by(Comparison) %>%
+  summarise(
+    Mean_Diff = mean(Difference),
+    Prob_Positive = mean(Difference > 0),
+    CrI_lower = quantile(Difference, 0.025),
+    CrI_upper = quantile(Difference, 0.975),
+    Significant = ifelse(CrI_lower > 0 | CrI_upper < 0, "Yes", "No")
+  ) %>%
+  arrange(desc(abs(Mean_Diff)))
+
+print(pairwise_summary_HFI0 %>% 
+        mutate(across(where(is.numeric), ~round(., 4))))
+
+# Join significance info to plot data
+continent_comparisons_HFI0_plot <- continent_comparisons_HFI0 %>%
+  left_join(pairwise_summary_HFI0 %>% select(Comparison, Significant), by = "Comparison")
+
+# Visualize with significance coloring
+plot_pairwise_HFI0 <- ggplot(continent_comparisons_HFI0_plot, 
+                             aes(x = Difference, y = reorder(Comparison, Difference, median), 
+                                 fill = Significant)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black", linewidth = 0.8) +
+  stat_halfeye(.width = c(0.66, 0.95)) +
+  scale_fill_manual(
+    name = "Continental contrast",
+    values = c("Yes" = "skyblue3", "No" = "grey"),
+    labels = c("Yes" = "Significant", "No" = "Not significant")
+  ) +
+  labs(x = "Difference in Δ measured species richness (LRR) at pristine sites", 
+       y = NULL) +
+  theme_minimal(base_size = 15) +
+  theme(legend.position = "bottom",
+          panel.grid.major.y = element_blank(),
+          axis.title.x.bottom = element_text(margin = margin(t = 15)),
+          axis.title.x.top = element_text(margin = margin(b = 15))
+        )
+
+print(plot_pairwise_HFI0)
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/pairwise_continent_comparisons_HFI0.tiff", 
+       plot_pairwise_HFI0, width = 10, height = 10, dpi = 300)
+```
+
+
+
+
+
+
+
+
