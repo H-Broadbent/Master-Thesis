@@ -431,7 +431,7 @@ final_map <- ggplot() +
     alpha = 0.8
   ) +
   scale_color_gradientn(
-    name = "Δ measured species richness (%)",
+    name = "species richness change (%)",
     colors = c("#B2182B", "#D73027", "#F46D43", "#FC8D59", "#FEE06B", "#FFE8A0", 
                "#D9EF8B", "#A6D96A", "#66BD63", "#1A9850", "#006837"),
     values = scales::rescale(c(-100, -75, -50, -25, -10, 0, 10, 25, 50, 75, 100)),
@@ -469,7 +469,107 @@ print(final_map)
 ggsave("~/Eawag/Master Project/5_Submission/Poster/figures/global_map_with_study_summary.tiff", 
        final_map, height = 10, width = 18, dpi = 300, compression = "lzw")
 ```
+### Create map by latitude
 
+```{r global-map latitude}
+### Create map by latitude (Tropical vs Non-Tropical)
+
+# Set projection (EPSG:4326 = WGS84 geographic coordinate system)
+target_crs <- "EPSG:4326"
+
+# Load and process HFP raster (Unchanged)
+hfp_raster <- terra::rast(path_hfp)
+hfp_raster_agg <- aggregate(hfp_raster, fact = 10, fun = mean)
+hfp_raster_reproj <- project(hfp_raster_agg, target_crs, method = "bilinear")
+
+# Convert to dataframe for ggplot
+hfp_df <- as.data.frame(hfp_raster_reproj, xy = TRUE) %>%
+  rename(human_footprint_value = 3) %>%
+  filter(!is.na(human_footprint_value))
+
+# --- MODIFICATION 1: CLASSIFY ZONES ---
+data_spatial_sf <- data_spatial %>%
+  st_as_sf(coords = c("avg_Longitude", "avg_Latitude"), crs = "EPSG:4326") %>%
+  st_transform(crs = target_crs) %>%
+  mutate(
+    x = st_coordinates(.)[,1],
+    y = st_coordinates(.)[,2],
+    # Approx latitude for Tropics is 23.4368 degrees
+    region = ifelse(y >= -23.4368 & y <= 23.4368, "Tropical", "Non-tropical")
+  ) %>%
+  st_drop_geometry()
+
+# Load world coastlines
+world <- ne_coastline(scale = "medium", returnclass = "sf") %>%
+  st_transform(crs = target_crs)
+
+# Create map
+final_map <- ggplot() +
+  # Human footprint background layer (Unchanged)
+  geom_raster(
+    data = hfp_df,
+    aes(x = x, y = y, fill = human_footprint_value),
+    alpha = 0.8
+  ) +
+  scale_fill_gradient(
+    name = "Human Footprint Index",
+    low = "white", 
+    high = "navy",
+    limits = c(0, 50),
+    guide = guide_colorbar(
+      title.position = "top",
+      title.hjust = 0.5,
+      barwidth = 30, 
+      barheight = 0.5,
+      order = 1
+    )
+  ) +
+  # Coastlines
+  geom_sf(data = world, color = "gray40", linewidth = 0.3, fill = NA) +
+  
+  # --- MODIFICATION 2: PLOT ZONES ---
+  geom_point(
+    data = data_spatial_sf,
+    aes(x = x, y = y, color = region), # Map color to the new 'region' column
+    size = 4,
+    shape = 16,
+    alpha = 0.9 # Increased alpha slightly for better visibility
+  ) +
+  
+  # Change gradient scale to manual categorical scale
+  scale_color_manual(
+    name = "Region",
+    values = c("Tropical" = "#D73027", "Non-tropical" = "#4575B4"), # Red for Tropical, Blue for Non-tropical
+    guide = guide_legend(
+      title.position = "top",
+      title.hjust = 0.5,
+      order = 2,
+      override.aes = list(size = 5)
+    )
+  ) +
+  
+  coord_sf(expand = FALSE) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.box = "vertical",
+    legend.title = element_text(size = 18, face = "bold", hjust = 0.5),
+    legend.text = element_text(size = 16),
+    plot.title = element_text(size = 20, face = "bold", hjust = 0.5),
+    axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+    plot.background = element_rect(fill = NA, color = NA),
+    panel.background = element_rect(fill = NA, color = NA)
+  )
+
+print(final_map)
+
+# Save 
+ggsave("~/Eawag/Publication/global_map_tropics.tiff", 
+       final_map, height = 10, width = 18, dpi = 300, compression = "lzw")
+```
 
 ## Exploratory Analysis
 
@@ -518,7 +618,7 @@ p_alpha <- ggplot(df_complete, aes(x = alpha_diversity)) +
   geom_histogram(                 bins = 30, fill = "gray70", color = "black", alpha = 0.7) +
   geom_vline(xintercept = median(df$alpha_diversity, na.rm = TRUE), 
              linetype = "dashed", color = "#E74C3C", linewidth = 1) +
-  labs(x = "Δ measured species richness (LRR)",
+  labs(x = "Species richness change (LRR)",
        y = "Number of Studies") +
   theme_minimal(base_size = 15) +
   theme(axis.title.x = element_text(margin = margin(t = 10)),
@@ -555,6 +655,7 @@ p2_hfp <- ggplot(df_complete, aes(x = HFP_weighted_buffer)) +
   labs(x = "Human Footprint Index",
        y = "Number of studies") +
   theme_minimal(base_size = 15) +
+  ylim(0,70) +
   theme(
     legend.position = "bottom",
     panel.grid.minor = element_blank(),
@@ -592,9 +693,9 @@ p2_richness <- ggplot(df_complete, aes(x = new_total_richness)) +
   geom_histogram(bins = 30, alpha = 0.7, fill = "gray70", color = "black", linewidth = 0.3) +
   geom_vline(xintercept = median(df_complete$new_total_richness, na.rm = TRUE), 
              linetype = "dashed", color = "#E74C3C", linewidth = 1) +
-  labs(x = "Reference site species richness",
-       y = "Number of studies") +
+  labs(x = "Reference site species richness", y = "") +
   theme_minimal(base_size = 15) +
+  ylim(0,70) +
   theme(
     legend.position = "bottom",
     panel.grid.minor = element_blank(),
@@ -608,6 +709,24 @@ p2_richness <- ggplot(df_complete, aes(x = new_total_richness)) +
 print(p_alpha)
 
 ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/local_diversity_loss_distribution.tiff", p_alpha, 
+       width = 9, height = 5, dpi = 300)
+
+
+
+combined_histogramms <- p2_hfp + p2_richness &
+  plot_annotation(tag_levels = 'a') 
+print(combined_histogramms)
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/predictors_histogramms_combined.tiff", combined_histogramms, 
+       width = 9, height = 5, dpi = 300)
+
+
+
+combined_distributions <- p1_hfp + p1_richness &
+  plot_annotation(tag_levels = 'a') 
+print(combined_distributions)
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/predictors_distributions_combined.tiff", combined_distributions, 
        width = 9, height = 5, dpi = 300)
 
 
@@ -628,6 +747,227 @@ ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/predictors_hf
 
 
 ```
+```{r}
+library(ggplot2)
+library(ggdist)
+library(patchwork)
+
+# --- Plot 1: Human Footprint (Keep the Continent Labels) ---
+p_hfp <- ggplot(df_complete, aes(x = continent_label, y = HFP_weighted_buffer, fill = continent)) +
+  stat_halfeye(adjust = 0.5, width = 0.6, .width = 0, justification = -0.3, point_colour = NA, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, fatten = 0) +
+  stat_summary(
+    fun.data = function(x) {
+      m <- median(x, na.rm = TRUE)
+      return(data.frame(y = m, ymin = m, ymax = m))
+    },
+    geom = "errorbar", width = 0.3, size = 1, color = "black"
+  ) +
+  geom_point(size = 0.8, alpha = 0.2, position = position_jitter(seed = 1, width = 0.1)) +
+  scale_fill_manual(values = continent_colors) +
+  labs(x = "", y = "Human Footprint Index") +
+  coord_flip() + 
+  theme_minimal(base_size = 14) + 
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_blank() # Remove y-title, but keep axis text
+  )
+
+# --- Plot 2: Richness (REMOVE Continent Labels) ---
+p_richness <- ggplot(df_complete, aes(x = continent_label, y = new_total_richness, fill = continent)) +
+  stat_halfeye(adjust = 0.5, width = 0.6, .width = 0, justification = -0.3, point_colour = NA, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, fatten = 0) +
+  stat_summary(
+    fun.data = function(x) {
+      m <- median(x, na.rm = TRUE)
+      return(data.frame(y = m, ymin = m, ymax = m))
+    },
+    geom = "errorbar", width = 0.3, size = 1, color = "black"
+  ) +
+  geom_point(size = 0.8, alpha = 0.2, position = position_jitter(seed = 1, width = 0.1)) +
+  scale_fill_manual(values = continent_colors) +
+  labs(x = "", y = "Reference site species richness") +
+  coord_flip() + 
+  theme_minimal(base_size = 14) + 
+  theme(
+    legend.position = "none",
+    axis.title.x = element_text(margin = margin(t = 10)),
+    axis.title.y = element_blank(), # Remove "continent" title
+    axis.text.y = element_blank(),  # Remove "Africa", "Europe" etc.
+    axis.ticks.y = element_blank()  # Remove tick marks
+  )
+
+# --- Combine them side by side ---
+# Patchwork will automatically align the panels
+combined_distributions <- p_hfp + p_richness + 
+  plot_annotation(tag_levels = 'a')
+
+print(combined_distributions)
+
+ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/predictors_distributions_combined.tiff", 
+       combined_distributions, width = 9, height = 5, dpi = 300)
+```
+
+
+
+
+#### Latitude analysis
+
+```{r}
+library(tidyverse)
+library(ggdist)
+library(patchwork)
+
+# 1. Prepare Data for Latitude Analysis
+# -------------------------------------
+# We need to re-attach latitude information to the filtered df_complete
+lat_analysis_df <- df_complete %>%
+  left_join(data_spatial %>% dplyr::select(Article_ID, Record_ID, avg_Latitude), 
+            by = c("Article_ID", "Record_ID")) %>%
+  mutate(
+    # Define regions based on Tropics (approx 23.44 degrees)
+    region = ifelse(abs(avg_Latitude) <= 23.4368, "Tropical", "Non-tropical"),
+    # Set factor levels for consistent plotting order
+    region = factor(region, levels = c("Tropical", "Non-tropical"))
+  ) %>%
+  filter(!is.na(region))
+
+# Calculate sample sizes for labels
+region_counts <- lat_analysis_df %>%
+  group_by(region) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  mutate(label = paste0(region, "\n(n=", n, ")"))
+
+# Join labels back to main dataframe
+lat_analysis_df <- lat_analysis_df %>%
+  left_join(region_counts, by = "region")
+
+# 2. Statistical Testing (Wilcoxon Rank-Sum Test)
+# -----------------------------------------------
+# Comparison for Human Footprint
+test_hfp <- wilcox.test(HFP_weighted_buffer ~ region, data = lat_analysis_df)
+
+# Comparison for Alpha Diversity Change (LRR)
+test_alpha <- wilcox.test(alpha_diversity ~ region, data = lat_analysis_df)
+
+# Comparison for Reference Richness (New addition)
+test_richness <- wilcox.test(new_total_richness ~ region, data = lat_analysis_df)
+
+# Print results to console
+cat("\n--- REGIONAL COMPARISON STATS ---\n")
+cat("1. Human Footprint (Tropical vs Non-Tropical):\n")
+print(test_hfp)
+cat("\n2. Alpha Diversity Change (Tropical vs Non-Tropical):\n")
+print(test_alpha)
+cat("\n3. Reference Richness (Tropical vs Non-Tropical):\n")
+print(test_richness)
+
+# Calculate medians for each region
+region_medians <- lat_analysis_df %>%
+  group_by(region) %>%
+  summarise(
+    Median_HFP = median(HFP_weighted_buffer, na.rm = TRUE),
+    Median_Richness = median(new_total_richness, na.rm = TRUE),
+    Median_Alpha = median(alpha_diversity, na.rm = TRUE),
+    Count = n() # Optional: to double check sample sizes
+  )
+
+print(region_medians)
+
+
+# 3. Visualization
+# -----------------------------------------------
+# Define region colors (Red for Tropical, Blue for Non-Tropical)
+region_colors <- c("Tropical" = "coral", "Non-tropical" = "skyblue2")
+
+# Shared theme setup
+transparent_theme <- theme_minimal(base_size = 15) +
+  theme(
+    legend.position = "none",
+    panel.background = element_rect(fill = "transparent", color = NA),
+    plot.background = element_rect(fill = "transparent", color = NA)
+  )
+
+# Plot A: Human Footprint
+p_lat_hfp <- ggplot(lat_analysis_df, aes(x = label, y = HFP_weighted_buffer, fill = region)) +
+  stat_halfeye(adjust = 0.5, width = 0.6, .width = 0, justification = -0.3, point_colour = NA, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, fatten = 0) +
+  stat_summary(fun.data = function(x) data.frame(y=median(x), ymin=median(x), ymax=median(x)), 
+               geom="errorbar", width=0.3, size=1) +
+  geom_point(size = 0.8, alpha = 0.2, position = position_jitter(seed = 1, width = 0.1)) +
+  scale_fill_manual(values = region_colors) +
+  labs(x = NULL, y = "Human Footprint Index") +
+  transparent_theme
+
+# Plot B: Reference Site Richness (The new plot)
+p_lat_richness <- ggplot(lat_analysis_df, aes(x = label, y = new_total_richness, fill = region)) +
+  stat_halfeye(adjust = 0.5, width = 0.6, .width = 0, justification = -0.3, point_colour = NA, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, fatten = 0) +
+  stat_summary(fun.data = function(x) data.frame(y=median(x), ymin=median(x), ymax=median(x)), 
+               geom="errorbar", width=0.3, size=1) +
+  geom_point(size = 0.8, alpha = 0.2, position = position_jitter(seed = 1, width = 0.1)) +
+  scale_fill_manual(values = region_colors) +
+  labs(x = NULL, y = "Reference site species richness") +
+  transparent_theme
+
+# Plot C: Alpha Diversity Change (Moved to end as it is the response variable usually)
+p_lat_alpha <- ggplot(lat_analysis_df, aes(x = label, y = alpha_diversity, fill = region)) +
+  stat_halfeye(adjust = 0.5, width = 0.6, .width = 0, justification = -0.3, point_colour = NA, alpha = 0.7) +
+  geom_boxplot(width = 0.12, outlier.shape = NA, alpha = 0.8, fatten = 0) +
+  stat_summary(fun.data = function(x) data.frame(y=median(x), ymin=median(x), ymax=median(x)), 
+               geom="errorbar", width=0.3, size=1) +
+  geom_point(size = 0.8, alpha = 0.2, position = position_jitter(seed = 1, width = 0.1)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  scale_fill_manual(values = region_colors) +
+  labs(x = NULL, y = "Species richness change (LRR)") +
+  transparent_theme
+
+# Combine plots: HFP + Richness + Alpha Change
+# Note: I ordered them (HFP -> Richness -> Alpha) assuming Alpha is the outcome 
+# and the others are predictors/context, but you can swap them easily.
+combined_lat <- p_lat_hfp + p_lat_richness + p_lat_alpha + 
+  plot_layout(nrow = 1) +
+  plot_annotation(tag_levels = 'a') & 
+  transparent_theme
+
+print(combined_lat)
+
+# Save (Width increased to accommodate 3 panels)
+ggsave(file.path("~/Eawag/Publication/latitude_comparison_3panel.tif"), combined_lat, 
+       width = 10, height = 5, dpi = 300, compression = "lzw", bg = "transparent")
+
+```
+
+```{r}
+# Ensure patchwork is loaded (it should be from the setup chunk)
+# library(patchwork)
+
+# Assuming 'final_map' created in the "global-map" chunk exists
+# Assuming 'combined_lat' created in the "latitude-analysis" chunk exists
+
+# 1. Combine the plots with specific width ratios
+composite_fig <- final_map + combined_lat +
+plot_layout(
+ nrow = 1,
+ widths = c(2, 1) # The first plot (map) gets 2 units of width, the second gets 1 unit.
+ ) +
+ # Optional: Add uppercase tags (A for map, B for the plots panel)
+ plot_annotation(tag_levels = 'A') &
+ # Ensure theme elements are consistent if needed (e.g., font sizes)
+ theme(plot.tag = element_text(size = 20, face = "bold"))
+
+# 2. Preview to check proportions
+print(composite_fig)
+
+# 3. Save the large composite figure
+# We use a wide aspect ratio (e.g., width 18, height 8) to accommodate the layout
+ggsave("~/Eawag/Publication/composite_map_and_latitude_plots.tiff",
+composite_fig,
+width = 18, height = 8,
+dpi = 300, compression = "lzw")
+```
+
 ### Taxonomic Breakdown
 
 ```{r}
@@ -656,7 +996,7 @@ richness_breakdown <- ggplot(data_summary, aes(x = avg_richness, y = taxa, color
   facet_wrap(~continent, ncol = 2) +
   scale_x_log10(breaks = c(1, 5, 10, 20, 50, 100, 200, 500)) +
   scale_color_manual(values = continent_colors) +
-  labs(x = expression(paste(bar(x), " reference site species richness (Log Scale)")),
+  labs(x = expression(paste(bar(x), " reference site species richness")),
        y = "") +
   theme_minimal(base_size = 15) +
   theme(legend.position = "none", strip.text = element_text(face = "bold"),
@@ -755,27 +1095,20 @@ ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/trivariate_co
 library(ggplot2)
 library(dplyr)
 
-# 1. Define the groups
 gray_continents <- c("Europe", "Oceania", "Africa")
 
-# 2. Create the Plot
 trivariate_correlaiton <- ggplot(df_complete, aes(y = new_total_richness, x = HFP_weighted_buffer)) +
 
-  # All Data Points (Keep original colors) ---
   geom_point(aes(color = continent), size = 1.5, alpha = 0.3) +
-
-  # Gray Lines (Europe, Oceania, Africa) ---
-
+  
   geom_smooth(data = subset(df_complete, continent %in% gray_continents), 
               aes(group = continent), 
               method = "lm", se = FALSE, color = "gray60", linewidth = 0.8) +
 
-  # Colored Lines (The significant ones) 
   geom_smooth(data = subset(df_complete, !continent %in% gray_continents), 
               aes(color = continent), 
               method = "lm", se = FALSE, linewidth = 1) +
 
-  # Global Trend (Black)
   geom_smooth(method = "lm", color = "black", fill = "gray20", 
               linewidth = 1, alpha = 0.2) +
   
@@ -785,8 +1118,8 @@ trivariate_correlaiton <- ggplot(df_complete, aes(y = new_total_richness, x = HF
   theme_minimal(base_size = 16) + 
 
   theme(
-    legend.position = "right",
-    legend.direction = "vertical",
+    legend.position = "bottom",
+    legend.direction = "horizontal",
     axis.title.x = element_text(margin = margin(t = 10)),
     axis.title.y = element_text(margin = margin(r = 10)),
     legend.text = element_text(size = 12),
@@ -796,10 +1129,10 @@ trivariate_correlaiton <- ggplot(df_complete, aes(y = new_total_richness, x = HF
 
 trivariate_correlaiton
 
-# Save the plot
+# Save
 ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/trivariate_correlations_poster.tif", 
        trivariate_correlaiton, 
-       width = 9, height = 4, dpi = 300, bg = NA)
+       width = 6, height = 5, dpi = 300, bg = NA)
 ```
 
 
@@ -810,7 +1143,6 @@ cor_overall <- cor.test(df_complete$HFP_scaled, df_complete$richness_scaled,
                         method = "pearson")
 print(cor_overall)
 
-# Continent-specific correlations
 cor_by_continent <- df_complete %>%
   group_by(continent) %>%
   summarise(
@@ -935,8 +1267,8 @@ library(loo)
 
 #### Model specification
 
-```{r echo=FALSE}
-# 1. Fit candidate models
+```{r}
+# Fit candidate models
 m1_hfp <- brm(alpha_diversity ~ HFP_scaled, 
               family = student(),
               data = df_complete,
@@ -977,7 +1309,7 @@ loo_m4 <- loo(m4_both, moment_match = TRUE)
 loo_m5 <- loo(m5_richness_int, moment_match = TRUE)
 loo_m6 <- loo(m6_continent_int, moment_match = TRUE)
 
-# 3. Compare models
+# Compare models
 loo_compare(loo_m1, loo_m2, loo_m3, loo_m4, loo_m5, loo_m6)
 
 9.6 / (2*5)
@@ -986,7 +1318,7 @@ loo_compare(loo_m1, loo_m2, loo_m3, loo_m4, loo_m5)
 
 -7 / (2* 4.6)
 
- # 5. Check if richness and continent are redundant
+ # Check if richness and continent are redundant
 summary(m4_both)  # If credible intervals overlap 0 after adding both, they're redundant
 summary(m6_continent_int)
 
@@ -1186,7 +1518,7 @@ model_asymp_both <- brm(
 
 #### Model comparison
 
-```{r}
+```{r warning=FALSE}
 loo_asymp <- loo(model_asymp, moment_match = TRUE)
 loo_linear <- loo(model_linear, moment_match = TRUE)
 
@@ -1318,7 +1650,7 @@ ggsave("~/Eawag/R/Master_thesis/3_Results/Plots/model_fit_r2.tiff", plot_r2, wid
 
 #### I2
 
-```{r}
+```{r warning=FALSE}
 library(brms)
 library(dplyr)
 library(posterior) # brms uses this for handling draws
@@ -1375,8 +1707,6 @@ priors_weak <- c(
   prior(student_t(3, 0, 10), class = "sigma")
 )
 
-# Run the Weak Prior Model
-
 model_weak_prior <- brm(
   bf(alpha_diversity ~ b * exp(c * HFP_scaled),
      b ~ continent + (1 | Article_ID),
@@ -1398,7 +1728,7 @@ prior_comparison <- data.frame(
   `Weak intercept b`     = as_draws_df(model_weak_prior)$b_b_Intercept
 )
 
-# Prepare data for plotting
+# Prepare data 
 plot_data_all <- prior_comparison %>%
   pivot_longer(everything(), names_to = "Model_Prior", values_to = "value") %>%
   mutate(
@@ -1418,10 +1748,8 @@ plot_data_all <- prior_comparison %>%
 
 plot_prior_sensitivity <- ggplot(plot_data_all, aes(x = value, fill = Model_Prior_Clean)) +
   
-  # Density plots with transparency
   geom_density(alpha = 0.4, linewidth = 0.3, color = "black") +
-  
-  # This ensures 'b' and 'c' get their own x-axis ranges
+
   facet_wrap(~Parameter, scales = "free", ncol = 2) +
   
   scale_fill_manual(values = c(
@@ -1932,12 +2260,12 @@ plot_curves <- ggplot() +
     limits = c(-1.5, 1),
     sec.axis = sec_axis(
       transform = ~ (exp(.) - 1) * 100,
-      name = "Species Richness Change (%)",
+      name = "Species richness change (%)",
       breaks = c(-90, -75, -50, -25, 0, 50, 100, 150)
     )
   ) +
   labs(x = "Human Footprint Index",
-       y = "Species Richness Change (LRR)",
+       y = "Species richness change (LRR)",
        color = "Continent") +
   theme_minimal(base_size = 15) +
   theme(panel.grid.minor = element_blank(),
@@ -1956,6 +2284,8 @@ ggsave("~/Eawag/Master Project/5_Submission/code/1_my_data/3_plots/decay_plot.ti
 ```
 
 ### posterior distributions of each continent
+
+!At the HFI mean!
 
 ```{r}
 
@@ -2123,7 +2453,7 @@ plot_pairwise_HFI0 <- ggplot(continent_comparisons_HFI0_plot,
     values = c("Yes" = "skyblue3", "No" = "grey"),
     labels = c("Yes" = "Significant", "No" = "Not significant")
   ) +
-  labs(x = "Difference in Δ measured species richness (LRR) at pristine sites", 
+  labs(x = " Δ species richness change (LRR) at pristine sites", 
        y = NULL) +
   theme_minimal(base_size = 15) +
   theme(legend.position = "bottom",
